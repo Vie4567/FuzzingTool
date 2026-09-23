@@ -1,0 +1,9 @@
+/users/sign_in
+/-/health
+/-/liveness
+/api/v4/
+/api/v4/projects
+/api/v4/users
+/api/v4/groups
+/-/graphql
+/-/admin

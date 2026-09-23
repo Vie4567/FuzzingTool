@@ -1,0 +1,16 @@
+/_next/
+/_next/static/
+/_next/data/
+/api/
+/api/auth/
+/api/auth/session
+/.env
+/.env.local
+/.env.development.local
+/package.json
+/.git/config
+/public/
+/static/
+/favicon.ico
+/robots.txt
+/sitemap.xml

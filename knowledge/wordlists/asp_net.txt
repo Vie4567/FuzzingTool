@@ -1,0 +1,16 @@
+/Web.config
+/web.config
+/appsettings.json
+/appsettings.Development.json
+/appsettings.Production.json
+/App_Data/
+/App_Config/
+/trace.axd
+/elmah.axd
+/swagger/
+/swagger/index.html
+/.git/config
+/api/
+/api/v1/
+/health
+/diagnostics

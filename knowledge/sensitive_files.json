@@ -1,0 +1,140 @@
+{
+  "_meta": {
+    "description": "Danh sách file và thư mục nhạy cảm phổ biến. Được Wordlist Generator Layer-4.5 nạp để bổ sung vào wordlist.",
+    "version": "1.0",
+    "usage": "wordlist_gen.py → Layer 4.5 Sensitive Files"
+  },
+
+  "config_files": {
+    "label": "Config & Secrets",
+    "paths": [
+      "/.env", "/.env.local", "/.env.backup", "/.env.bak", "/.env.old",
+      "/.env.production", "/.env.development", "/.env.staging",
+      "/config.php", "/config.js", "/config.json", "/config.yaml", "/config.yml",
+      "/configuration.php", "/settings.php", "/settings.py",
+      "/appsettings.json", "/appsettings.Development.json",
+      "/web.config", "/Web.config",
+      "/application.yml", "/application.properties",
+      "/database.yml", "/secrets.yml",
+      "/.htpasswd", "/.htaccess",
+      "/config/database.php", "/config/app.php"
+    ]
+  },
+
+  "backup_files": {
+    "label": "Backup & Archive",
+    "paths": [
+      "/backup.zip", "/backup.tar.gz", "/backup.sql", "/backup.sql.gz",
+      "/database.sql", "/database.sql.gz", "/database.tar.gz",
+      "/db.sql", "/db_backup.sql", "/dump.sql",
+      "/site.zip", "/site.tar.gz", "/www.zip",
+      "/htdocs.zip", "/public_html.zip",
+      "/backup/", "/backups/", "/bak/",
+      "/old/", "/archive/",
+      "/backup.php.bak", "/index.php.bak",
+      "/wp-config.php.bak", "/config.php.bak"
+    ]
+  },
+
+  "log_files": {
+    "label": "Log & Debug",
+    "paths": [
+      "/debug.log", "/error.log", "/access.log", "/app.log",
+      "/application.log", "/server.log", "/php_errors.log",
+      "/laravel.log", "/storage/logs/laravel.log",
+      "/log/", "/logs/", "/var/log/",
+      "/tmp/error.log",
+      "/debug", "/_debug_toolbar",
+      "/phpinfo.php", "/info.php", "/php_info.php",
+      "/test.php", "/phptest.php"
+    ]
+  },
+
+  "git_vcs": {
+    "label": "Version Control Leaks",
+    "paths": [
+      "/.git/", "/.git/config", "/.git/HEAD", "/.git/index",
+      "/.git/COMMIT_EDITMSG", "/.git/logs/HEAD",
+      "/.git/refs/heads/master", "/.git/refs/heads/main",
+      "/.gitignore", "/.gitmodules",
+      "/.svn/", "/.svn/entries",
+      "/.hg/", "/.bzr/"
+    ]
+  },
+
+  "secrets_keys": {
+    "label": "Keys & Credentials",
+    "paths": [
+      "/id_rsa", "/id_rsa.pub", "/.ssh/id_rsa", "/.ssh/authorized_keys",
+      "/server.key", "/server.crt", "/server.pem",
+      "/private.key", "/private.pem",
+      "/.aws/credentials", "/.aws/config",
+      "/.npmrc", "/.pypirc",
+      "/credentials.json", "/service-account.json",
+      "/google-credentials.json", "/firebase-adminsdk.json"
+    ]
+  },
+
+  "ci_cd_devops": {
+    "label": "CI/CD & DevOps",
+    "paths": [
+      "/Dockerfile", "/docker-compose.yml", "/docker-compose.yaml",
+      "/.dockerignore",
+      "/.travis.yml", "/.travis.yaml",
+      "/Jenkinsfile", "/.jenkins/",
+      "/.github/", "/.github/workflows/",
+      "/.gitlab-ci.yml",
+      "/Makefile", "/Gruntfile.js", "/Gulpfile.js",
+      "/.circleci/config.yml"
+    ]
+  },
+
+  "package_managers": {
+    "label": "Package Manager Files",
+    "paths": [
+      "/package.json", "/package-lock.json", "/yarn.lock", "/pnpm-lock.yaml",
+      "/composer.json", "/composer.lock",
+      "/Gemfile", "/Gemfile.lock",
+      "/requirements.txt", "/Pipfile", "/Pipfile.lock", "/poetry.lock",
+      "/go.mod", "/go.sum",
+      "/Cargo.toml", "/Cargo.lock",
+      "/pom.xml", "/build.gradle", "/build.gradle.kts"
+    ]
+  },
+
+  "database_admin": {
+    "label": "Database Admin Tools",
+    "paths": [
+      "/phpmyadmin/", "/pma/", "/myadmin/", "/mysql/",
+      "/phppgadmin/", "/pgadmin/",
+      "/adminer.php", "/adminer/",
+      "/dbadmin/", "/sqlbuddy/",
+      "/h2-console", "/h2/"
+    ]
+  },
+
+  "common_admin": {
+    "label": "Admin & Management",
+    "paths": [
+      "/admin/", "/admin", "/administrator/",
+      "/manage/", "/management/", "/manager/",
+      "/panel/", "/cpanel/", "/control/",
+      "/dashboard/", "/console/",
+      "/backend/", "/back-office/",
+      "/internal/", "/private/",
+      "/superadmin/", "/root/"
+    ]
+  },
+
+  "api_testing": {
+    "label": "API Testing & Docs",
+    "paths": [
+      "/swagger/", "/swagger-ui/", "/swagger-ui.html", "/swagger-ui/index.html",
+      "/api-docs", "/api-docs/", "/api-explorer",
+      "/openapi.json", "/openapi.yaml",
+      "/v2/api-docs", "/v3/api-docs",
+      "/redoc", "/graphiql",
+      "/graphql/playground"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+/docs
+/redoc
+/openapi.json
+/.env
+/requirements.txt
+/api/v1/
+/health
+/.git/config

@@ -1,0 +1,12 @@
+/administrator/
+/administrator/index.php
+/components/
+/modules/
+/plugins/
+/templates/
+/configuration.php
+/cache/
+/tmp/
+/logs/
+/robots.txt
+/.htaccess

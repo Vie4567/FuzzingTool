@@ -1,0 +1,98 @@
+{
+  "_meta": {
+    "description": "Regex patterns để trích xuất đường dẫn và endpoint từ JavaScript bundle. Được CH-3 nạp trong Recon.",
+    "version": "1.0",
+    "usage": "tech_recon.py → CH-3 JS Bundle Analysis"
+  },
+
+  "http_clients": {
+    "label": "HTTP Client Calls",
+    "patterns": [
+      "fetch\\([\"']([^\"'?#]+)",
+      "axios\\.(?:get|post|put|delete|patch|head)\\([\"']([^\"'?#]+)",
+      "axios\\([\"']([^\"'?#]+)",
+      "\\$\\.(?:get|post|ajax)\\([\"']([^\"'?#]+)",
+      "XMLHttpRequest[\\s\\S]*?\\.open\\(\\s*[\"']\\w+[\"']\\s*,\\s*[\"']([^\"']+)",
+      "\\.request\\([\"']([/][^\"'?#]+)",
+      "superagent\\.(?:get|post)\\([\"']([^\"'?#]+)",
+      "got\\([\"']([^\"'?#]+)",
+      "request\\.(?:get|post)\\([\"']([^\"'?#]+)"
+    ]
+  },
+
+  "route_definitions": {
+    "label": "Frontend Route Definitions",
+    "patterns": [
+      "path:\\s*[\"']([/][^\"'*]+)",
+      "route\\([\"']([/][^\"']+)",
+      "useRoutes\\([\\s\\S]*?path:\\s*[\"']([^\"']+)",
+      "createRoute\\([\"']([/][^\"']+)",
+      "Router\\.(?:get|post|put|delete|patch)\\([\"']([^\"']+)",
+      "app\\.(?:get|post|put|delete|patch)\\([\"']([^\"']+)",
+      "router\\.(?:get|post|put|delete|patch)\\([\"']([^\"']+)"
+    ]
+  },
+
+  "decorators_annotations": {
+    "label": "Framework Decorators / Annotations",
+    "patterns": [
+      "@(?:Get|Post|Put|Delete|Patch|Options)\\([\"']([^\"']+)",
+      "@RequestMapping\\([\"']([^\"']+)",
+      "@GetMapping\\([\"']([^\"']+)",
+      "@PostMapping\\([\"']([^\"']+)",
+      "@Path\\([\"']([^\"']+)"
+    ]
+  },
+
+  "api_path_constants": {
+    "label": "API Path String Constants",
+    "patterns": [
+      "(?:const|let|var)\\s+\\w*(?:url|path|endpoint|api|route)\\w*\\s*=\\s*[\"']([/][^\"']+)",
+      "baseURL:\\s*[\"']([^\"']+)",
+      "BASE_URL\\s*=\\s*[\"']([^\"']+)",
+      "API_URL\\s*=\\s*[\"']([^\"']+)",
+      "API_BASE\\s*=\\s*[\"']([^\"']+)",
+      "ENDPOINT\\s*=\\s*[\"']([^\"']+)",
+      "[\"'][/]api[/][^\"']+[\"']",
+      "[\"'][/]v\\d+[/][^\"']+[\"']"
+    ]
+  },
+
+  "graphql": {
+    "label": "GraphQL Operations",
+    "patterns": [
+      "gql`[\\s\\S]*?(?:query|mutation|subscription)\\s+(\\w+)",
+      "graphql`[\\s\\S]*?(?:query|mutation)\\s+(\\w+)",
+      "(?:query|mutation)\\s+(\\w+)\\s*(?:\\([^)]*\\))?\\s*\\{",
+      "operationName:\\s*[\"'](\\w+)"
+    ]
+  },
+
+  "openapi_inline": {
+    "label": "Inline OpenAPI / Swagger Spec",
+    "patterns": [
+      "\"path\":\\s*\"([/][^\"]+)\"",
+      "\"operationId\":\\s*\"([^\"]+)\"",
+      "swaggerSpec[\\s\\S]*?\"paths\":[\\s\\S]*?\"([/][^\"]+)\""
+    ]
+  },
+
+  "next_js": {
+    "label": "Next.js Specific",
+    "patterns": [
+      "__NEXT_DATA__[\\s\\S]*?\"page\":\\s*\"([^\"]+)\"",
+      "router\\.push\\([\"']([^\"'?#]+)",
+      "href:\\s*[\"']([/][^\"']+)",
+      "as:\\s*[\"']([/][^\"']+)"
+    ]
+  },
+
+  "angular": {
+    "label": "Angular Specific",
+    "patterns": [
+      "loadChildren:\\s*\\(\\)\\s*=>\\s*import\\([\"']([^\"']+)",
+      "component:\\s*\\w+,\\s*path:\\s*[\"']([^\"']+)",
+      "RouterModule\\.forRoot\\([\\s\\S]*?path:\\s*[\"']([^\"']+)"
+    ]
+  }
+}

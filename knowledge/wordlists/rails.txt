@@ -1,0 +1,17 @@
+/.env
+/Gemfile
+/Gemfile.lock
+/config/database.yml
+/config/secrets.yml
+/config/credentials.yml.enc
+/public/
+/db/schema.rb
+/db/seeds.rb
+/log/
+/log/production.log
+/.git/config
+/rails/info/properties
+/sidekiq
+/resque
+/api/
+/api/v1/

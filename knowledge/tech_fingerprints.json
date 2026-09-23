@@ -1,0 +1,86 @@
+{
+  "_meta": {
+    "description": "Chữ ký nhận dạng framework từ HTML DOM, HTTP headers, cookies. Được CH-1 và CH-2 nạp.",
+    "version": "1.0",
+    "usage": "tech_recon.py → CH-1 Header Analysis + CH-2 DOM Parser"
+  },
+
+  "headers": {
+    "Server": {
+      "apache":    ["Apache", "Apache/"],
+      "nginx":     ["nginx", "nginx/"],
+      "iis":       ["Microsoft-IIS", "IIS/"],
+      "cloudflare":["cloudflare"],
+      "gunicorn":  ["gunicorn"],
+      "uvicorn":   ["uvicorn"],
+      "jetty":     ["Jetty"],
+      "tomcat":    ["Apache-Coyote", "Apache Tomcat"]
+    },
+    "X-Powered-By": {
+      "php":        ["PHP/"],
+      "asp_net":    ["ASP.NET"],
+      "express":    ["Express"],
+      "next_js":    ["Next.js"],
+      "rails":      ["Phusion Passenger"]
+    },
+    "X-Generator": {
+      "wordpress":  ["WordPress"],
+      "drupal":     ["Drupal"],
+      "joomla":     ["Joomla"],
+      "ghost":      ["Ghost"]
+    },
+    "X-Drupal-Cache":  {"drupal": ["*"]},
+    "X-Redirect-By":   {"wordpress": ["WordPress"]},
+    "X-AspNet-Version":{"asp_net": ["*"]},
+    "X-Api-Version":   {"_any_api": ["*"]}
+  },
+
+  "cookies": {
+    "JSESSIONID":         "java_spring",
+    "PHPSESSID":          "php",
+    "ASP.NET_SessionId":  "asp_net",
+    "connect.sid":        "node_express",
+    "csrftoken":          "django",
+    "laravel_session":    "laravel",
+    "_rails_session":     "rails",
+    "__utma":             "google_analytics",
+    "_ga":                "google_analytics",
+    "cf_clearance":       "cloudflare_waf"
+  },
+
+  "dom_attributes": {
+    "__next":          "next_js",
+    "__nuxt":          "nuxt_js",
+    "ng-version":      "angular",
+    "data-reactroot":  "react",
+    "data-v-":         "vue_js",
+    "__GATSBY":        "gatsby",
+    "svelte":          "svelte",
+    "id=wp-":          "wordpress",
+    "class=drupal-":   "drupal"
+  },
+
+  "body_patterns": {
+    "wp-content":            "wordpress",
+    "wp-includes":           "wordpress",
+    "Powered by WordPress":  "wordpress",
+    "Drupal.settings":       "drupal",
+    "Joomla!":               "joomla",
+    "django":                "django",
+    "/__next":               "next_js",
+    "/_nuxt":                "nuxt_js",
+    "ng-app":                "angular"
+  },
+
+  "path_patterns": {
+    "/wp-admin":    "wordpress",
+    "/wp-content":  "wordpress",
+    "/wp-json":     "wordpress",
+    "/admin/":      "django_or_generic",
+    "/actuator":    "spring_boot",
+    "/_profiler":   "symfony",
+    "/_debug_toolbar": "django",
+    "/rails/info":  "rails",
+    "/__debug__":   "django"
+  }
+}

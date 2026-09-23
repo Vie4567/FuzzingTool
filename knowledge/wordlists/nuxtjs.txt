@@ -1,0 +1,9 @@
+/_nuxt/
+/__nuxt_error
+/api/
+/.env
+/package.json
+/.git/config
+/public/
+/static/
+/favicon.ico

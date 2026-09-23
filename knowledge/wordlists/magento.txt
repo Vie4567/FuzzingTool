@@ -1,0 +1,12 @@
+/admin/
+/downloader/
+/app/etc/local.xml
+/app/etc/config.xml
+/var/log/
+/var/report/
+/pub/
+/pub/static/
+/api/rest/
+/api/soap/
+/robots.txt
+/.htaccess

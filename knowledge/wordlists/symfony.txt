@@ -1,0 +1,14 @@
+/.env
+/.env.local
+/.env.prod
+/public/
+/var/log/
+/config/
+/composer.json
+/composer.lock
+/bin/console
+/_profiler/
+/_wdt/
+/api/
+/api/docs.json
+/.git/config

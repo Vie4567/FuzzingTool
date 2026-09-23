@@ -1,0 +1,145 @@
+{
+  "_meta": {
+    "description": "Bản đồ ánh xạ các framework/CMS với file wordlist (.txt) tương ứng.",
+    "version": "1.0",
+    "usage": "tech_recon.py → CH-5 Probe + Wordlist Generator Layer-1"
+  },
+  "express": {
+    "label": "Node.js / Express",
+    "wordlists": [
+      "knowledge/wordlists/express.txt"
+    ]
+  },
+  "nestjs": {
+    "label": "NestJS (Node.js)",
+    "wordlists": [
+      "knowledge/wordlists/nestjs.txt"
+    ]
+  },
+  "django": {
+    "label": "Python / Django",
+    "wordlists": [
+      "knowledge/wordlists/django.txt"
+    ]
+  },
+  "flask": {
+    "label": "Python / Flask",
+    "wordlists": [
+      "knowledge/wordlists/flask.txt"
+    ]
+  },
+  "fastapi": {
+    "label": "Python / FastAPI",
+    "wordlists": [
+      "knowledge/wordlists/fastapi.txt"
+    ]
+  },
+  "laravel": {
+    "label": "PHP / Laravel",
+    "wordlists": [
+      "knowledge/wordlists/laravel.txt"
+    ]
+  },
+  "symfony": {
+    "label": "PHP / Symfony",
+    "wordlists": [
+      "knowledge/wordlists/symfony.txt"
+    ]
+  },
+  "codeigniter": {
+    "label": "PHP / CodeIgniter",
+    "wordlists": [
+      "knowledge/wordlists/codeigniter.txt"
+    ]
+  },
+  "spring_boot": {
+    "label": "Java / Spring Boot",
+    "wordlists": [
+      "knowledge/wordlists/spring_boot.txt"
+    ]
+  },
+  "rails": {
+    "label": "Ruby on Rails",
+    "wordlists": [
+      "knowledge/wordlists/rails.txt"
+    ]
+  },
+  "asp_net": {
+    "label": "C# / ASP.NET",
+    "wordlists": [
+      "knowledge/wordlists/asp_net.txt"
+    ]
+  },
+  "nextjs": {
+    "label": "React / Next.js",
+    "wordlists": [
+      "knowledge/wordlists/nextjs.txt"
+    ]
+  },
+  "nuxtjs": {
+    "label": "Vue / Nuxt.js",
+    "wordlists": [
+      "knowledge/wordlists/nuxtjs.txt"
+    ]
+  },
+  "angular": {
+    "label": "Angular (SPA)",
+    "wordlists": [
+      "knowledge/wordlists/angular.txt"
+    ]
+  },
+  "wordpress": {
+    "label": "CMS / WordPress",
+    "wordlists": [
+      "knowledge/wordlists/wordpress.txt"
+    ]
+  },
+  "drupal": {
+    "label": "CMS / Drupal",
+    "wordlists": [
+      "knowledge/wordlists/drupal.txt"
+    ]
+  },
+  "joomla": {
+    "label": "CMS / Joomla",
+    "wordlists": [
+      "knowledge/wordlists/joomla.txt"
+    ]
+  },
+  "magento": {
+    "label": "CMS / Magento (E-commerce)",
+    "wordlists": [
+      "knowledge/wordlists/magento.txt"
+    ]
+  },
+  "shopify": {
+    "label": "CMS / Shopify",
+    "wordlists": [
+      "knowledge/wordlists/shopify.txt"
+    ]
+  },
+  "strapi": {
+    "label": "Headless CMS / Strapi",
+    "wordlists": [
+      "knowledge/wordlists/strapi.txt"
+    ]
+  },
+  "grafana": {
+    "label": "Monitoring / Grafana",
+    "wordlists": [
+      "knowledge/wordlists/grafana.txt"
+    ]
+  },
+  "jenkins": {
+    "label": "CI/CD / Jenkins",
+    "wordlists": [
+      "knowledge/wordlists/jenkins.txt"
+    ]
+  },
+  "gitlab": {
+    "label": "DevOps / GitLab",
+    "wordlists": [
+      "knowledge/wordlists/gitlab.txt"
+    ]
+  }
+}

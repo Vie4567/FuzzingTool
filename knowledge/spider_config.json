@@ -1,0 +1,62 @@
+{
+  "_meta": {
+    "description": "Cấu hình cho crawler Spider (CH-4). Định nghĩa chiến lược adaptive depth thay vì hardcode.",
+    "version": "1.0",
+    "usage": "tech_recon.py → CH-4 ReconSpider"
+  },
+
+  "adaptive_depth": {
+    "description": "Depth được điều chỉnh theo đặc điểm trang web, không cố định 3",
+    "rules": [
+      {
+        "condition": "Phát hiện OpenAPI/GraphQL schema (CH-6)",
+        "depth": 1,
+        "rationale": "Đã có đầy đủ endpoint từ schema, crawl sâu thêm vô ích"
+      },
+      {
+        "condition": "Trang SPA (React/Vue/Angular) — phần lớn routing ở client-side",
+        "depth": 2,
+        "rationale": "HTML server-side rất ít link, JS bundle (CH-3) mới là nguồn chính"
+      },
+      {
+        "condition": "Trang server-side render (WordPress/Drupal/Django)",
+        "depth": 4,
+        "rationale": "Nhiều link HTML, crawl sâu hơn để khám phá toàn bộ"
+      },
+      {
+        "condition": "Trang không xác định được framework",
+        "depth": 3,
+        "rationale": "Mặc định an toàn"
+      },
+      {
+        "condition": "Phát hiện WAF đang chặn mạnh (>30% request bị 403/429)",
+        "depth": 1,
+        "rationale": "Giảm số request để tránh block hoàn toàn"
+      }
+    ]
+  },
+
+  "limits": {
+    "default_max_depth": 3,
+    "default_max_pages": 150,
+    "spa_max_pages": 50,
+    "ssr_max_pages": 250,
+    "request_delay_ms": 300,
+    "request_timeout_ms": 8000,
+    "concurrent_requests": 5
+  },
+
+  "exclusion_patterns": [
+    "logout", "signout", "delete", "remove",
+    "javascript:void", "#", "mailto:", "tel:",
+    ".jpg", ".png", ".gif", ".svg", ".ico",
+    ".css", ".woff", ".woff2", ".ttf",
+    ".mp4", ".mp3", ".pdf"
+  ],
+
+  "priority_paths": [
+    "/api", "/admin", "/dashboard",
+    "/login", "/auth", "/account",
+    "/settings", "/config", "/manage"
+  ]
+}

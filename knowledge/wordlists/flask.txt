@@ -1,0 +1,14 @@
+/.env
+/requirements.txt
+/Pipfile
+/static/
+/templates/
+/.git/config
+/.git/HEAD
+/config.py
+/settings.py
+/api/
+/swagger/
+/flasgger/
+/console
+/uploads/

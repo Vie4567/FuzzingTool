@@ -1,0 +1,97 @@
+{
+  "_meta": {
+    "description": "Chữ ký nhận dạng WAF/CDN từ HTTP response headers, cookies, body patterns. Được CH-1 nạp trong Recon.",
+    "version": "1.0",
+    "usage": "tech_recon.py → CH-1 WAF detection"
+  },
+
+  "cloudflare": {
+    "label": "Cloudflare",
+    "headers": ["cf-ray", "cf-cache-status", "cf-request-id", "cf-edge-cache"],
+    "cookies": ["__cfduid", "__cf_bm", "cf_clearance"],
+    "server_values": ["cloudflare"],
+    "body_patterns": ["Attention Required! | Cloudflare", "ray ID"],
+    "evasion_hints": ["Rotate IP via proxy", "Add Cf-Connecting-Ip spoofing", "Use real browser UA"]
+  },
+
+  "aws_waf": {
+    "label": "AWS WAF / CloudFront",
+    "headers": ["x-amzn-requestid", "x-amz-cf-id", "x-amz-cf-pop", "x-cache"],
+    "cookies": ["AWSALB", "AWSALBCORS", "aws-waf-token"],
+    "server_values": ["AmazonS3", "CloudFront"],
+    "body_patterns": ["AWS WAF", "Request blocked"],
+    "evasion_hints": ["Slow down rate", "Rotate User-Agent"]
+  },
+
+  "akamai": {
+    "label": "Akamai",
+    "headers": ["x-akamai-transformed", "akamai-grn", "x-akamai-request-id", "x-check-cacheable"],
+    "cookies": ["AkamaiEdge"],
+    "server_values": ["AkamaiGHost"],
+    "body_patterns": ["Access Denied", "Reference #"],
+    "evasion_hints": ["Rotate IP", "Space out requests"]
+  },
+
+  "imperva": {
+    "label": "Imperva / Incapsula",
+    "headers": ["x-iinfo", "x-cdn", "x-sigsci-tags", "x-sigsci-requestid"],
+    "cookies": ["visid_incap", "incap_ses", "nlbi_"],
+    "server_values": ["Incapsula"],
+    "body_patterns": ["Incapsula incident", "Request unsuccessful"],
+    "evasion_hints": ["Use legitimate user session pattern"]
+  },
+
+  "f5_bigip": {
+    "label": "F5 BIG-IP ASM",
+    "headers": ["x-cnection", "x-wa-info", "x-f5-lburi"],
+    "cookies": ["BIGipServer", "TS01", "TS"],
+    "server_values": ["BigIP"],
+    "body_patterns": ["The requested URL was rejected"],
+    "evasion_hints": ["Vary Content-Type", "Change encoding"]
+  },
+
+  "modsecurity": {
+    "label": "ModSecurity (Apache/Nginx)",
+    "headers": ["x-modsecurity-id", "x-webknight-action"],
+    "cookies": [],
+    "server_values": [],
+    "body_patterns": ["ModSecurity", "Mod_Security", "NOYB", "Not Acceptable"],
+    "evasion_hints": ["Use URL encoding variations", "Parameter tampering evasion"]
+  },
+
+  "sucuri": {
+    "label": "Sucuri WAF",
+    "headers": ["x-sucuri-id", "x-sucuri-cache"],
+    "cookies": [],
+    "server_values": ["Sucuri/Cloudproxy"],
+    "body_patterns": ["Access Denied - Sucuri Website Firewall"],
+    "evasion_hints": ["Rotate IP"]
+  },
+
+  "wordfence": {
+    "label": "Wordfence (WordPress plugin)",
+    "headers": [],
+    "cookies": ["wfvt_"],
+    "server_values": [],
+    "body_patterns": ["Your access to this site has been limited", "Wordfence"],
+    "evasion_hints": ["Slow down", "Rotate IP"]
+  },
+
+  "azure_fd": {
+    "label": "Azure Front Door / WAF",
+    "headers": ["x-azure-ref", "x-cache", "x-ms-ref"],
+    "cookies": [],
+    "server_values": ["Microsoft-Azure-Application-Gateway"],
+    "body_patterns": ["Azure Web Application Firewall"],
+    "evasion_hints": ["Rotate IP", "Adjust request rate"]
+  },
+
+  "ddos_guard": {
+    "label": "DDoS-Guard",
+    "headers": ["server"],
+    "cookies": ["__ddg1_", "__ddg2_", "__ddgid_", "__ddgmark_"],
+    "server_values": ["DDoS-Guard"],
+    "body_patterns": ["DDoS-Guard"],
+    "evasion_hints": ["Resolve challenge manually first"]
+  }
+}

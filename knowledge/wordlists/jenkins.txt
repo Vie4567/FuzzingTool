@@ -1,0 +1,9 @@
+/login
+/j_acegi_security_check
+/api/json
+/api/xml
+/manage
+/script
+/computer/api/json
+/pluginManager/api/json
+/credentials/

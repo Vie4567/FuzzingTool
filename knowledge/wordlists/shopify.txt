@@ -1,0 +1,9 @@
+/admin
+/account
+/cart.json
+/products.json
+/collections.json
+/pages.json
+/blogs.json
+/cdn/shop/
+/checkouts/

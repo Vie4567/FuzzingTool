@@ -1,0 +1,8 @@
+/assets/
+/assets/i18n/
+/favicon.ico
+/manifest.json
+/.env
+/package.json
+/ngsw.json
+/ngsw-worker.js

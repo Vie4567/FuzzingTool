@@ -1,0 +1,9 @@
+/login
+/api/health
+/api/org
+/api/users
+/api/dashboards/home
+/api/search
+/api/datasources
+/api/admin/settings
+/api/admin/users

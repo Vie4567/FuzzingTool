@@ -1,0 +1,17 @@
+/admin/
+/user/login
+/user/register
+/sites/default/settings.php
+/sites/default/files/
+/modules/
+/themes/
+/profiles/
+/update.php
+/install.php
+/cron.php
+/xmlrpc.php
+/api/
+/jsonapi/
+/.htaccess
+/robots.txt
+/web.config

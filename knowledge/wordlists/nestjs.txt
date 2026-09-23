@@ -1,0 +1,15 @@
+/.env
+/package.json
+/.git/config
+/api
+/api/swagger
+/swagger
+/dist/
+/src/
+/graphql
+/graphiql
+/metrics
+/health
+/health/liveness
+/health/readiness
+/favicon.ico
