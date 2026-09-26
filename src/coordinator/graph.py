@@ -12,9 +12,13 @@ Cấu trúc graph:
 """
 
 import json
+import os
 import uuid
 import logging
 from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
@@ -62,10 +66,16 @@ def _get_decision_engine(config: dict = None) -> DecisionEngine:
 
     if _decision_engine is None:
         config = config or {}
-        llm = ChatOpenAI(
-            model=config.get("llm_model", "gpt-4o"),
-            temperature=config.get("llm_temperature", 0.1),
-        )
+        llm_kwargs = {
+            "model": config.get("llm_model") or os.getenv("LLM_MODEL", "gpt-4o"),
+            "temperature": config.get("llm_temperature") or float(os.getenv("LLM_TEMPERATURE", "0.1")),
+            "api_key": os.getenv("OPENAI_API_KEY"),
+        }
+        # DeepSeek / OpenAI-compatible provider: set OPENAI_BASE_URL in .env
+        base_url = config.get("llm_base_url") or os.getenv("OPENAI_BASE_URL")
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+        llm = ChatOpenAI(**llm_kwargs)
         _knowledge_store = KnowledgeStore(
             base_dir=config.get("knowledge_store_dir", "knowledge_store")
         )
@@ -177,7 +187,17 @@ def run_tech_recon(state: dict) -> dict:
     })
 
     try:
-        agent = TechReconAgent()
+        agent_config = state.get("config") or {}
+        from ..clients.neo4j_mcp_client import Neo4jMCPClient
+        mcp_factory = agent_config.get("mcp_client_factory")
+        if mcp_factory is None and agent_config.get("mcp_client") is None and agent_config.get("neo4j_enabled", True):
+            mcp_factory = Neo4jMCPClient
+        agent = TechReconAgent(
+            config=agent_config,
+            llm_limiter=llm_limiter,
+            mcp_client=agent_config.get("mcp_client"),
+            mcp_client_factory=mcp_factory,
+        )
         result = agent.execute(state["target_url"])
 
         state["tech_stack"] = result.get("tech_stack", {})

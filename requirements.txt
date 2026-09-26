@@ -2,3 +2,20 @@ langchain>=0.3.0
 langchain-openai>=0.2.0
 langchain-core>=0.3.0
 langgraph>=0.2.0
+
+# ── Phase 1: Neo4j + MCP ─────────────────────────────────────────
+neo4j>=5.26,<7
+mcp>=2.2,<3
+python-dotenv
+httpx>=0.28,<1
+beautifulsoup4>=4.12,<5
+PyYAML>=6,<7
+defusedxml>=0.7,<1
+
+# ── Testing ──────────────────────────────────────────────────────
+pytest
+pytest-asyncio
+respx>=0.22,<1
+
+# Report section update utility
+python-docx>=1.1,<2

@@ -5,6 +5,40 @@
     "usage": "tech_recon.py → CH-1 Header Analysis + CH-2 DOM Parser"
   },
 
+  "error_signatures": {
+    "Traceback (most recent call last)": "Python",
+    "at Object.<anonymous>": "Node.js",
+    "java.lang": "Java",
+    "Fatal error:": "PHP"
+  },
+
+  "technologies": {
+    "django": {"label": "Django", "category": "backend", "language": "Python", "rendering": "ssr", "wordlist_key": "django"},
+    "flask": {"label": "Flask", "category": "backend", "language": "Python", "rendering": "ssr", "wordlist_key": "flask"},
+    "fastapi": {"label": "FastAPI", "category": "backend", "language": "Python", "rendering": "ssr", "wordlist_key": "fastapi"},
+    "laravel": {"label": "Laravel", "category": "backend", "language": "PHP", "rendering": "ssr", "wordlist_key": "laravel"},
+    "symfony": {"label": "Symfony", "category": "backend", "language": "PHP", "rendering": "ssr", "wordlist_key": "symfony"},
+    "rails": {"label": "Rails", "category": "backend", "language": "Ruby", "rendering": "ssr", "wordlist_key": "rails"},
+    "spring_boot": {"label": "Spring Boot", "category": "backend", "language": "Java", "rendering": "ssr", "wordlist_key": "spring_boot"},
+    "express": {"label": "Express", "category": "backend", "language": "JavaScript", "wordlist_key": "express"},
+    "java_spring": {"label": "Java/Spring", "category": "backend", "language": "Java", "rendering": "ssr", "wordlist_key": "spring_boot"},
+    "node_express": {"label": "Node.js/Express", "category": "backend", "language": "JavaScript", "wordlist_key": "express"},
+    "codeigniter": {"label": "CodeIgniter", "category": "backend", "language": "PHP", "rendering": "ssr", "wordlist_key": "codeigniter"},
+    "asp_net": {"label": "ASP.NET", "category": "backend", "language": "C#", "wordlist_key": "asp_net"},
+    "php": {"label": "PHP", "category": "backend", "language": "PHP"},
+    "next_js": {"label": "Next.js", "category": "frontend", "language": "JavaScript", "rendering": "spa", "wordlist_key": "nextjs"},
+    "nuxt_js": {"label": "Nuxt.js", "category": "frontend", "language": "JavaScript", "rendering": "spa", "wordlist_key": "nuxtjs"},
+    "angular": {"label": "Angular", "category": "frontend", "rendering": "spa", "wordlist_key": "angular"},
+    "react": {"label": "React", "category": "frontend", "rendering": "spa"},
+    "vue_js": {"label": "Vue", "category": "frontend", "rendering": "spa"},
+    "svelte": {"label": "Svelte", "category": "frontend", "rendering": "spa"},
+    "gatsby": {"label": "Gatsby", "category": "frontend", "rendering": "spa"},
+    "wordpress": {"label": "WordPress", "category": "cms", "language": "PHP", "rendering": "ssr", "wordlist_key": "wordpress"},
+    "drupal": {"label": "Drupal", "category": "cms", "language": "PHP", "rendering": "ssr", "wordlist_key": "drupal"},
+    "joomla": {"label": "Joomla", "category": "cms", "language": "PHP", "rendering": "ssr", "wordlist_key": "joomla"},
+    "ghost": {"label": "Ghost", "category": "cms", "language": "JavaScript", "rendering": "ssr"}
+  },
+
   "headers": {
     "Server": {
       "apache":    ["Apache", "Apache/"],

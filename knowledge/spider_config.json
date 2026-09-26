@@ -9,26 +9,32 @@
     "description": "Depth được điều chỉnh theo đặc điểm trang web, không cố định 3",
     "rules": [
       {
+        "id": "api_schema",
         "condition": "Phát hiện OpenAPI/GraphQL schema (CH-6)",
         "depth": 1,
         "rationale": "Đã có đầy đủ endpoint từ schema, crawl sâu thêm vô ích"
       },
       {
+        "id": "spa",
         "condition": "Trang SPA (React/Vue/Angular) — phần lớn routing ở client-side",
         "depth": 2,
         "rationale": "HTML server-side rất ít link, JS bundle (CH-3) mới là nguồn chính"
       },
       {
+        "id": "ssr",
         "condition": "Trang server-side render (WordPress/Drupal/Django)",
         "depth": 4,
         "rationale": "Nhiều link HTML, crawl sâu hơn để khám phá toàn bộ"
       },
       {
+        "id": "default",
         "condition": "Trang không xác định được framework",
         "depth": 3,
         "rationale": "Mặc định an toàn"
       },
       {
+        "id": "waf_blocking",
+        "block_rate_threshold": 0.3,
         "condition": "Phát hiện WAF đang chặn mạnh (>30% request bị 403/429)",
         "depth": 1,
         "rationale": "Giảm số request để tránh block hoàn toàn"
@@ -42,8 +48,12 @@
     "spa_max_pages": 50,
     "ssr_max_pages": 250,
     "request_delay_ms": 300,
+    "request_jitter_ms": 100,
     "request_timeout_ms": 8000,
-    "concurrent_requests": 5
+    "concurrent_requests": 5,
+    "max_external_scripts": 10,
+    "max_sitemaps": 10,
+    "max_response_bytes": 5242880
   },
 
   "exclusion_patterns": [
