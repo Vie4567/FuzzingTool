@@ -35,8 +35,10 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import random
 import re
+import ssl
 import time
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
@@ -46,9 +48,11 @@ from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
 
 import httpx
+import truststore
 import yaml
 from bs4 import BeautifulSoup
 from defusedxml import ElementTree
+from dotenv import dotenv_values
 
 from src.graph_schema import endpoint_uid, normalize_target_url, scoped_uid
 
@@ -116,7 +120,8 @@ class TechReconAgent:
     Tech-Stack & Context Analyzer — Agent 1.
 
     Args:
-        config: Optional dict override (timeout_s, user_agent, aggressive_probe, ...)
+        config: Optional dict override (timeout_s, user_agent, aggressive_probe,
+                ca_bundle, ...)
         llm_limiter: LLMCallLimiter instance (nếu None, LLM sẽ không được gọi)
         http_client: Inject httpx.AsyncClient (chủ yếu để test)
     """
@@ -197,6 +202,26 @@ class TechReconAgent:
 
     # ─── Async core ──────────────────────────────────────────────────────────
 
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        """Use a custom CA bundle when configured; otherwise use the OS trust store."""
+        ca_bundle = self.config.get("ca_bundle") or os.getenv("SENTINEL_CA_BUNDLE")
+        if not ca_bundle:
+            ca_bundle = dotenv_values().get("SENTINEL_CA_BUNDLE")
+        if ca_bundle:
+            if not isinstance(ca_bundle, (str, os.PathLike)):
+                raise ValueError("ca_bundle must be a filesystem path")
+            bundle_path = Path(ca_bundle).expanduser().resolve()
+            if not bundle_path.is_file():
+                raise ValueError(f"Custom CA bundle does not exist: {bundle_path}")
+            logger.info("[TechRecon] TLS trust source: custom CA bundle %s", bundle_path)
+            try:
+                return ssl.create_default_context(cafile=str(bundle_path))
+            except (OSError, ssl.SSLError) as exc:
+                raise ValueError(f"Cannot load custom CA bundle {bundle_path}: {exc}") from exc
+
+        logger.debug("[TechRecon] TLS trust source: system certificate store")
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
     async def _execute_async(self, target_url: str) -> dict:
         """Điều phối toàn bộ 7-channel pipeline."""
         normalize_target_url(target_url)
@@ -220,6 +245,7 @@ class TechReconAgent:
             client = self._injected_client
             own_client = False
         else:
+            client_kwargs["verify"] = self._build_ssl_context()
             client = httpx.AsyncClient(**client_kwargs)
             own_client = True
 

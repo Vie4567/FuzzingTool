@@ -25,7 +25,10 @@ Neo4j tạm thời không khả dụng, agent ghi warning, đặt trạng thái 
   schema thu được được dùng để giảm crawl depth và trích endpoint/parameter.
 - CH-7: error probe chỉ chạy khi `aggressive_probe=True`.
 
-Các request dùng chung semaphore và bộ điều tiết delay/jitter toàn cục. Các kênh
+Các request dùng chung semaphore và bộ điều tiết delay/jitter toàn cục. TLS mặc
+định dùng system certificate store qua `truststore`. Khi `config["ca_bundle"]`
+hoặc `SENTINEL_CA_BUNDLE` được cung cấp, custom CA bundle được ưu tiên và thay
+thế system store; Agent không tắt certificate verification. Các kênh
 được chạy bất đồng bộ bằng `asyncio.gather(..., return_exceptions=True)`; lỗi một
 kênh không làm hỏng toàn bộ Agent. CH-4 chờ kết quả cần thiết từ CH-1/CH-2/CH-6
 để chọn depth nhưng vẫn được cô lập lỗi như các kênh khác.
@@ -98,7 +101,7 @@ vậy không cần thêm Graph Writer thành một LangGraph node riêng.
 - `docker-compose.yml`: Neo4j 5 Community tại cổng 7474/7687.
 - `scripts/init_neo4j.py`: khởi tạo và xác minh constraints/indexes.
 - `.env.example`: mẫu cấu hình Neo4j và LLM provider.
-- `requirements.txt`: MCP, Neo4j, HTTP/parser và test dependencies.
+- `requirements.txt`: MCP, Neo4j, HTTP/parser, system trust store và test dependencies.
 - `pytest.ini`, `.gitignore`: cấu hình test và file local.
 
 ### Tests
@@ -123,7 +126,9 @@ vậy không cần thêm Graph Writer thành một LangGraph node riêng.
   `TechReconAgent -> MCP Client -> stdio -> MCP Server -> Neo4j -> get_subgraph`.
 - Smoke run kiểm tra được 1 Target, 13 Endpoint, 4 Parameter, tổng 21 node và
   20 relationship; chạy lặp giữ nguyên số lượng.
-- Kết quả test gần nhất: `200 passed` (198 unit + 2 live integration).
+- TLS system store đã được xác nhận trên một target có certificate chain thiếu
+  intermediate: Agent kết nối thành công mà không tắt certificate verification.
+- Kết quả test gần nhất: `205 passed` (203 unit + 2 live integration).
 
 Lệnh xác minh:
 
@@ -142,3 +147,16 @@ docker compose up -d neo4j
 - GraphQL đã introspect query/mutation và arguments. Việc flatten toàn bộ nested
   input, union/interface chuyên sâu là khả năng mở rộng, không ảnh hưởng output
   contract hoặc tiêu chí hoàn thành Module 2.
+
+## 6. Bug fix sau commit `3f5166b`
+
+- Khắc phục `CERTIFICATE_VERIFY_FAILED` trên các target gửi thiếu intermediate
+  certificate bằng cách dùng system certificate store qua `truststore`, vẫn giữ
+  certificate verification bắt buộc.
+- Hỗ trợ custom CA bundle với thứ tự ưu tiên:
+  `config["ca_bundle"]` -> biến môi trường `SENTINEL_CA_BUNDLE` -> giá trị trong
+  `.env` -> system certificate store.
+- Custom CA bundle thay thế system store; path không tồn tại hoặc bundle không
+  hợp lệ làm Agent fail sớm với thông báo rõ ràng.
+- Bổ sung đọc `.env` ngay cả khi chạy `TechReconAgent` độc lập, không thông qua
+  Coordinator.

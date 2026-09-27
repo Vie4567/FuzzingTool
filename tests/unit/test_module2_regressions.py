@@ -1,7 +1,9 @@
 import asyncio
 import json
+import ssl
 import time
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -16,6 +18,66 @@ FAST = {"request_delay_ms": 0, "request_jitter_ms": 0}
 
 def agent(**kwargs):
     return TechReconAgent(config={**FAST, **kwargs})
+
+
+def test_tls_uses_system_store_by_default(monkeypatch):
+    monkeypatch.delenv("SENTINEL_CA_BUNDLE", raising=False)
+    context = object()
+    factory = MagicMock(return_value=context)
+    monkeypatch.setattr("src.agents.tech_recon.truststore.SSLContext", factory)
+
+    assert agent()._build_ssl_context() is context
+    factory.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def test_tls_custom_config_bundle_replaces_environment_and_system_store(monkeypatch):
+    configured = Path("configured-ca.pem").resolve()
+    environment = Path("environment-ca.pem").resolve()
+    monkeypatch.setenv("SENTINEL_CA_BUNDLE", str(environment))
+    monkeypatch.setattr("src.agents.tech_recon.Path.is_file", lambda self: True)
+    custom_context = object()
+    custom_factory = MagicMock(return_value=custom_context)
+    system_factory = MagicMock()
+    monkeypatch.setattr("src.agents.tech_recon.ssl.create_default_context", custom_factory)
+    monkeypatch.setattr("src.agents.tech_recon.truststore.SSLContext", system_factory)
+
+    assert agent(ca_bundle=str(configured))._build_ssl_context() is custom_context
+    custom_factory.assert_called_once_with(cafile=str(configured.resolve()))
+    system_factory.assert_not_called()
+
+
+def test_tls_custom_bundle_can_come_from_environment(monkeypatch):
+    bundle = Path("environment-ca.pem").resolve()
+    monkeypatch.setenv("SENTINEL_CA_BUNDLE", str(bundle))
+    monkeypatch.setattr("src.agents.tech_recon.Path.is_file", lambda self: True)
+    custom_context = object()
+    custom_factory = MagicMock(return_value=custom_context)
+    monkeypatch.setattr("src.agents.tech_recon.ssl.create_default_context", custom_factory)
+
+    assert agent()._build_ssl_context() is custom_context
+    custom_factory.assert_called_once_with(cafile=str(bundle.resolve()))
+
+
+def test_tls_custom_bundle_is_loaded_from_dotenv_for_standalone_agent(monkeypatch):
+    bundle = Path("dotenv-ca.pem").resolve()
+    monkeypatch.delenv("SENTINEL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr("src.agents.tech_recon.dotenv_values", lambda: {
+        "SENTINEL_CA_BUNDLE": str(bundle),
+    })
+    monkeypatch.setattr("src.agents.tech_recon.Path.is_file", lambda self: True)
+    custom_context = object()
+    custom_factory = MagicMock(return_value=custom_context)
+    monkeypatch.setattr("src.agents.tech_recon.ssl.create_default_context", custom_factory)
+
+    assert agent()._build_ssl_context() is custom_context
+    custom_factory.assert_called_once_with(cafile=str(bundle.resolve()))
+
+
+def test_tls_rejects_missing_custom_bundle_before_request(monkeypatch):
+    monkeypatch.delenv("SENTINEL_CA_BUNDLE", raising=False)
+    missing = Path("missing.pem").resolve()
+    with pytest.raises(ValueError, match="Custom CA bundle does not exist"):
+        agent(ca_bundle=str(missing))._build_ssl_context()
 
 
 @pytest.mark.parametrize("script_url", [

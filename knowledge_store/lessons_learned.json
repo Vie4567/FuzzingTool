@@ -1,1 +1,108 @@
-﻿{"lessons": []}
+{
+  "lessons": [
+    {
+      "lesson": "Khi tech stack xác định rõ ràng (ASP.NET/C# trên nginx) và không có WAF, wordlist chuyên biệt nhỏ (khoảng 20-30 entries) vẫn đủ để tìm endpoint HTTP 200, hiệu quả hơn wordlist generic khổng lồ.",
+      "evidence": "Wordlist 22 entries tạo ra 3 endpoint HTTP 200 trên target ASP.NET/nginx không WAF; tech_recon đã cung cấp 41 paths làm nền tảng.",
+      "applicable_when": {
+        "waf_detected": "false",
+        "backend": "ASP.NET",
+        "web_server": "nginx"
+      },
+      "confidence": 0.75,
+      "id": "L001",
+      "created_at": "2026-09-27T08:52:32.329983+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Không có WAF là điều kiện thuận lợi để fuzz trực tiếp mà không cần cấu hình evasion phức tạp, giúp tiết kiệm thời gian và tăng tốc pipeline.",
+      "evidence": "WAF: None; quyết định Dgen_002 bỏ qua evasion và fuzzing vẫn thành công với 3 hits HTTP 200.",
+      "applicable_when": {
+        "waf_detected": "false"
+      },
+      "confidence": 0.9,
+      "id": "L002",
+      "created_at": "2026-09-27T08:52:32.329983+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Chuỗi quyết định tuần tự tech_recon → wordlist_gen → fuzzing → param_disc hoạt động trơn tru khi mỗi agent trước cung cấp đủ dữ liệu đầu vào cho agent sau, nhưng wordlist quá nhỏ có thể bỏ sót endpoint quan trọng.",
+      "evidence": "Tất cả 6 agents đều success; 5 verified, 2 filtered; wordlist chỉ 22 entries nhưng vẫn đủ cho param discovery.",
+      "applicable_when": {
+        "agents_executed": "all_success"
+      },
+      "confidence": 0.7,
+      "id": "L003",
+      "created_at": "2026-09-27T08:52:32.329983+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Soft 404 filter đóng vai trò quan trọng trong việc giảm false positive, bằng chứng là 2 kết quả bị lọc khỏi 7 ứng viên ban đầu.",
+      "evidence": "Results: 5 verified, 2 filtered sau khi soft404_filter chạy thành công.",
+      "applicable_when": {
+        "soft404_filter": "success"
+      },
+      "confidence": 0.8,
+      "id": "L004",
+      "created_at": "2026-09-27T08:52:32.329983+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Với target ASP.NET/C# trên nginx không có WAF, wordlist nhỏ (~22 entries) kết hợp 41 paths từ tech recon là đủ để đạt tỷ lệ hit HTTP 200 tốt, không cần wordlist lớn.",
+      "evidence": "Session này: wordlist_gen tạo 22 entries, fuzzing 22 requests thu được 4 endpoint HTTP 200, cuối cùng 9 verified results. Tương đồng cao (similarity 0.725) với session trước cùng stack cũng 22 requests và 3 hits HTTP 200.",
+      "applicable_when": {
+        "tech_stack": "ASP.NET/C# on nginx",
+        "waf": "none"
+      },
+      "confidence": 0.85,
+      "id": "L005",
+      "created_at": "2026-09-27T09:34:48.108770+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Khi tech_recon đã thu thập được tập paths nền tảng đáng kể (>=40), nên chuyển thẳng sang wordlist_gen chuyên biệt thay vì mở rộng recon, vì paths này đủ để định hướng fuzzing.",
+      "evidence": "Drecon_001 quyết định proceed_to_wordlist sau khi có 41 paths; toàn bộ pipeline sau đó chạy success, không cần quay lại recon.",
+      "applicable_when": {
+        "tech_recon_paths_count": ">=40",
+        "waf": "none"
+      },
+      "confidence": 0.8,
+      "id": "L006",
+      "created_at": "2026-09-27T09:34:48.108770+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Khi WAF=None, bỏ qua cấu hình evasion giúp pipeline gọn và nhanh hơn mà không giảm hiệu quả phát hiện endpoint.",
+      "evidence": "Dgen_002 ghi nhận WAF=False nên không cần evasion; fuzzing vẫn thành công với 4 hits HTTP 200 và 0 errors.",
+      "applicable_when": {
+        "waf": "none"
+      },
+      "confidence": 0.9,
+      "id": "L007",
+      "created_at": "2026-09-27T09:34:48.108770+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Chuỗi quyết định tuần tự recon -> wordlist -> fuzzing -> param discovery hoạt động ổn định khi mỗi bước đều success và không có circuit breaker mở; nên giữ nguyên flow này cho các target tương tự.",
+      "evidence": "Cả 6 agent đều success, 0 errors, circuit breakers closed, 49 LLM calls còn dư; kết quả cuối 9 verified, 1 filtered.",
+      "applicable_when": {
+        "all_agents_status": "success",
+        "circuit_breaker_state": "closed"
+      },
+      "confidence": 0.85,
+      "id": "L008",
+      "created_at": "2026-09-27T09:34:48.108770+00:00",
+      "times_validated": 1
+    },
+    {
+      "lesson": "Soft404 filter loại bỏ được false positive hiệu quả ngay cả khi số lượng verified cao, nên luôn chạy bước này trước khi kết luận.",
+      "evidence": "Session này 9 verified và 1 filtered — nếu bỏ soft404_filter, 1 kết quả giả có thể lọt vào báo cáo.",
+      "applicable_when": {
+        "fuzzing_hits_http_200": ">=1"
+      },
+      "confidence": 0.75,
+      "id": "L009",
+      "created_at": "2026-09-27T09:34:48.108770+00:00",
+      "times_validated": 1
+    }
+  ]
+}

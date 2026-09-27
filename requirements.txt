@@ -8,6 +8,7 @@ neo4j>=5.26,<7
 mcp>=2.2,<3
 python-dotenv
 httpx>=0.28,<1
+truststore>=0.10,<1
 beautifulsoup4>=4.12,<5
 PyYAML>=6,<7
 defusedxml>=0.7,<1
