@@ -1,0 +1,43 @@
+{
+  "tool_name": "gobuster",
+  "category": "directory_dns_vhost_fuzzing",
+  "description": "Công cụ dò quét thư mục (dir), tên miền phụ (dns) và Virtual Host (vhost) bằng ngôn ngữ Go.",
+  "modes": {
+    "dir": "Quét file và thư mục ẩn trên Web Server (gobuster dir -u URL -w wordlist)",
+    "dns": "Quét subdomain bằng brute-force DNS (gobuster dns -d domain -w wordlist)",
+    "vhost": "Quét Virtual Hosts bằng cách inject Host header (gobuster vhost -u URL -w wordlist)"
+  },
+  "essential_options": {
+    "-u": "URL hoặc IP mục tiêu (cho mode dir và vhost)",
+    "-d": "Domain mục tiêu (cho mode dns)",
+    "-w": "Đường dẫn file Wordlist",
+    "-t": "Số lượng luồng song song (threads, mặc định: 10)",
+    "-x": "Các đuôi mở rộng file cần tìm (ví dụ: -x php,html,js,json,bak)",
+    "-s": "Danh sách Status Codes chấp nhận (ví dụ: -s '200,204,301,302,401,403')",
+    "-b": "Danh sách Status Codes loại bỏ (Blacklisted status codes)",
+    "-k": "Bỏ qua kiểm tra chứng chỉ SSL/TLS (Insecure SSL mode)",
+    "-H": "HTTP Header tùy chỉnh (ví dụ: -H 'Authorization: Bearer token')",
+    "-o": "File lưu kết quả xuất ra",
+    "-q": "Chế độ im lặng (Quiet mode, tắt banner)"
+  },
+  "agent_decision_heuristics": {
+    "directory_scan": {
+      "condition": "Fuzzing web directories with extension checks",
+      "recommended_options": {
+        "mode": "dir",
+        "-x": "php,html,js,json,bak",
+        "-s": "200,301,302,403",
+        "-k": true
+      },
+      "rationale": "Quét thư mục kèm các extension ứng dụng phổ biến và tự động bỏ qua lỗi SSL."
+    },
+    "vhost_discovery": {
+      "condition": "Discovering Virtual Hosts on shared server IP",
+      "recommended_options": {
+        "mode": "vhost",
+        "--append-domain": true
+      },
+      "rationale": "Quét Virtual Host để tìm các môi trường staging/admin ẩn trên cùng địa chỉ IP."
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "tool_name": "nmap",
+  "category": "reconnaissance_and_scanning",
+  "description": "Công cụ quét cổng, nhận diện phiên bản dịch vụ, kiểm thử SSL/TLS và phát hiện lỗ hổng/WAF qua Nmap Scripting Engine (NSE).",
+  "essential_options": {
+    "-p": "Cổng cần quét (ví dụ: -p80,443 hoặc -p1-65535)",
+    "-sV": "Nhận diện phiên bản dịch vụ (Service/Version detection)",
+    "-sC": "Chạy các NSE script mặc định an toàn (-sC tương đương --script=default)",
+    "-O": "Nhận diện hệ điều hành mục tiêu (OS detection)",
+    "-A": "Bật tất cả tính năng (OS detection, Version detection, Script scanning, Traceroute)",
+    "-T0_to_T5": "Mức độ thời gian quét (-T0 Drip, -T1 Sneak, -T2 Polite, -T3 Normal, -T4 Aggressive, -T5 Insane)",
+    "-oA": "Xuất kết quả ra cả 3 định dạng file (Normal, XML, Grepable)",
+    "-oJ": "Xuất kết quả dạng JSON/XML",
+    "--script": "Chạy các NSE script chuyên biệt (ví dụ: http-enum, http-headers, http-methods, http-waf-detect)",
+    "--script-args": "Truyền tham số tùy chỉnh cho NSE script (ví dụ: http.useragent='CustomAgent')"
+  },
+  "web_nse_scripts": {
+    "http_enum": {
+      "script": "http-enum",
+      "description": "Dò tìm các thư mục và ứng dụng Web phổ biến (WordPress, phpMyAdmin, Admin panels)."
+    },
+    "http_headers": {
+      "script": "http-headers",
+      "description": "Lấy HTTP Headers và Cookie thông tin dịch vụ Web."
+    },
+    "http_methods": {
+      "script": "http-methods",
+      "description": "Kiểm tra các HTTP Method được chấp nhận (GET, POST, PUT, DELETE, TRACE, OPTIONS)."
+    },
+    "http_waf_detect": {
+      "script": "http-waf-detect,http-waf-fingerprint",
+      "description": "Phát hiện sự hiện diện và loại Firewall/WAF đang bảo vệ mục tiêu."
+    },
+    "http_security_headers": {
+      "script": "http-security-headers",
+      "description": "Kiểm tra sự thiếu vắng các Security Headers (HSTS, CSP, X-Frame-Options)."
+    },
+    "ssl_enum_ciphers": {
+      "script": "ssl-enum-ciphers,ssl-cert",
+      "description": "Phân tích chứng chỉ SSL/TLS và các thuật toán mã hóa được hỗ trợ."
+    }
+  },
+  "agent_decision_heuristics": {
+    "stealth_scan": {
+      "condition": "Strict Stealth or WAF Bypass Required",
+      "recommended_options": {
+        "-T": "2",
+        "-p": "80,443",
+        "--script": "http-headers,http-methods",
+        "-sV": true
+      },
+      "rationale": "Sử dụng mức Timing Polite -T2 và chỉ quét cổng Web 80/443 để hạn chế cảnh báo IDS/WAF."
+    },
+    "full_web_recon": {
+      "condition": "Full Reconnaissance Requested",
+      "recommended_options": {
+        "-p": "80,443,8080,8443",
+        "-sV": true,
+        "--script": "http-enum,http-headers,http-methods,http-waf-detect"
+      },
+      "rationale": "Quét đa cổng Web và thực thi bộ script thăm dò Web tổng hợp."
+    }
+  }
+}

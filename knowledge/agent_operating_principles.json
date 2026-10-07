@@ -1,0 +1,9 @@
+{
+  "operating_principles": {
+    "principle_1_context_driven_decisions": "Mọi quyết định chọn tool và thiết lập option PHẢI dựa trên ngữ cảnh mục tiêu (Target Profile: Tech Stack, CMS, WAF, baseline HTTP status) và Tri thức Tool (Tool Knowledge), không dùng cứng hardcoded static commands.",
+    "principle_2_explicit_justification": "Mỗi khi chọn một Option (như -e, -ac, -mc, -rate, -p, -t), Agent PHẢI đưa ra lập luận (rationale) vì sao option đó là cần thiết cho tình huống mục tiêu hiện tại.",
+    "principle_3_adaptive_stealth": "Nếu phát hiện WAF, Agent PHẢI ưu tiên cấu hình các option né tránh WAF (giảm threads -t, hạ rate limit -rate, tăng delay -p, thêm custom headers) và tự giải trình chiến thuật này.",
+    "principle_4_filter_false_positives": "Nếu mục tiêu có phản hồi Soft 404 hoặc response size trùng lặp, Agent PHẢI chủ động kích hoạtAuto-Calibration (-ac) hoặc lọc theo kích thước (-fs) / status code (-fc).",
+    "principle_5_result_validation": "Sau khi thực thi tool, Agent PHẢI đánh giá dữ liệu thu được, nén kết quả và viết Báo cáo giải trình (Sub-Agent Justification Report) gửi Manager Coordinator thẩm định."
+  }
+}

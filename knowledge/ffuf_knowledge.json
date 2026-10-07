@@ -1,0 +1,93 @@
+{
+  "tool_name": "ffuf",
+  "description": "Công cụ Fuzzing & Dò quét Endpoint/Subdomain/Parameter mạnh mẽ bằng Go.",
+  "fuzz_keyword_injection_points": {
+    "url_path": {
+      "pattern": "https://target.com/FUZZ",
+      "description": "Tiêm từ khóa vào đường dẫn URL để dò tìm thư mục, file ẩn."
+    },
+    "subdomain": {
+      "pattern": "https://FUZZ.target.com",
+      "description": "Tiêm từ khóa vào Subdomain để dò tìm subdomain/vhost ẩn."
+    },
+    "vhost_header": {
+      "pattern": "Host: FUZZ.target.com",
+      "description": "Tiêm từ khóa vào HTTP Header Host để Virtual Host Discovery."
+    },
+    "get_parameter_name": {
+      "pattern": "https://target.com/page?FUZZ=test",
+      "description": "Tiêm từ khóa vào tên tham số GET để phát hiện hidden parameters."
+    },
+    "get_parameter_value": {
+      "pattern": "https://target.com/page?id=FUZZ",
+      "description": "Tiêm từ khóa vào giá trị tham số GET để fuzz dữ liệu đầu vào."
+    },
+    "post_data_form": {
+      "pattern": "-X POST -d 'user=FUZZ&pass=test'",
+      "description": "Tiêm từ khóa vào body form POST (urlencoded)."
+    },
+    "post_data_json": {
+      "pattern": "-X POST -H 'Content-Type: application/json' -d '{\"user\":\"FUZZ\"}'",
+      "description": "Tiêm từ khóa vào cấu trúc JSON trong body POST."
+    }
+  },
+  "essential_options": {
+    "-u": "URL mục tiêu chứa từ khóa FUZZ",
+    "-w": "Đường dẫn file Wordlist",
+    "-o": "File lưu kết quả xuất ra",
+    "-of": "Định dạng file xuất (json, csv, html, all)",
+    "-t": "Số luồng song song (threads, mặc định: 40)",
+    "-p": "Độ trễ giữa các request tính bằng giây (delay)",
+    "-rate": "Số request tối đa trên mỗi giây (rate limit)",
+    "-r": "Tự động chuyển hướng (Follow Redirects)",
+    "-s": "Chế độ im lặng (Silent mode)",
+    "-ac": "Tự động hiệu chỉnh lọc response ngẫu nhiên (Auto-calibration)",
+    "-acc": "Tự động hiệu chỉnh với chuỗi kiểm thử tùy chỉnh",
+    "-e": "Danh sách đuôi mở rộng file cần quét (ví dụ: .php,.html,.bak,.zip)",
+    "-recursion": "Bật tính năng quét đệ quy các thư mục tìm được",
+    "-recursion-depth": "Độ sâu tối đa khi quét đệ quy"
+  },
+  "filtering_and_matching_rules": {
+    "match_options": {
+      "-mc": "Lọc giữ lại theo HTTP Status Code (ví dụ: -mc 200,301,302,403 hoặc -mc all)",
+      "-ms": "Lọc giữ lại theo kích thước HTTP Response Size (bytes)",
+      "-mw": "Lọc giữ lại theo số lượng từ (word count)",
+      "-ml": "Lọc giữ lại theo số lượng dòng (line count)",
+      "-mt": "Lọc giữ lại theo thời gian phản hồi (ms)",
+      "-mr": "Lọc giữ lại theo Biểu thức chính quy (Regex match)"
+    },
+    "filter_options": {
+      "-fc": "Lọc loại bỏ theo HTTP Status Code (ví dụ: -fc 404,403,500)",
+      "-fs": "Lọc loại bỏ theo kích thước HTTP Response Size (ví dụ loại bỏ trang 404 giả -fs 1234)",
+      "-fw": "Lọc loại bỏ theo số lượng từ (word count)",
+      "-fl": "Lọc loại bỏ theo số lượng dòng (line count)",
+      "-ft": "Lọc loại bỏ theo thời gian phản hồi (ms)",
+      "-fr": "Lọc loại bỏ theo Biểu thức chính quy (Regex filter)"
+    }
+  },
+  "agent_decision_heuristics": {
+    "waf_evasion_strategy": {
+      "condition": "WAF_DETECTED == True",
+      "recommended_options": {
+        "-t": 5,
+        "-rate": 10,
+        "-p": 0.5,
+        "-H": "X-Forwarded-For: 127.0.0.1"
+      },
+      "rationale": "Giảm threads và rate-limit xuống thấp kèm delay ngẫu nhiên để tránh vi phạm ngưỡng Rate-Limiting của WAF."
+    },
+    "soft_404_handling": {
+      "condition": "Suspect Soft 404 or Wildcard Response",
+      "recommended_options": {
+        "-ac": true,
+        "-fc": "404"
+      },
+      "rationale": "Sử dụng Auto-Calibration (-ac) để ffuf tự đo đạc phản hồi giả 404 và loại bỏ tự động."
+    },
+    "cms_extension_strategy": {
+      "Joomla": ["-e", ".php,.xml,.ini,.bak,.old"],
+      "WordPress": ["-e", ".php,.json,.txt,.bak"],
+      "Laravel/ASP.NET": ["-e", ".env,.json,.config,.aspx,.bak"]
+    }
+  }
+}

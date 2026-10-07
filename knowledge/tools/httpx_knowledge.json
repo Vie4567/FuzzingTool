@@ -1,0 +1,45 @@
+{
+  "tool_name": "httpx",
+  "category": "http_probing_and_fingerprinting",
+  "description": "Công cụ thăm dò HTTP tốc độ cực cao từ ProjectDiscovery, bóc tách Status Code, Title, Web Server, Tech-Stack (Wappalyzer), TLS/SSL info và Hashes.",
+  "essential_options": {
+    "-u": "URL mục tiêu hoặc danh sách Host (-l file.txt)",
+    "-sc": "Hiển thị HTTP Response Status Code (-status-code)",
+    "-title": "Trích xuất HTML Page Title",
+    "-server": "Trích xuất HTTP Response Server Header",
+    "-td": "Phát hiện công nghệ Web / Tech Stack (-tech-detect)",
+    "-cl": "Hiển thị kích thước Response (-content-length)",
+    "-ct": "Hiển thị HTTP Content-Type Header",
+    "-rt": "Đo thời gian phản hồi Round-Trip (-response-time)",
+    "-location": "Trích xuất đường dẫn Redirect Location",
+    "-ip": "Hiển thị địa chỉ IP tương ứng",
+    "-favicon": "Tính toán mmh3 hash của file /favicon.ico để fingerprinting",
+    "-follow-redirects": "Tự động theo dõi các phản hồi chuyển hướng HTTP 30x",
+    "-json": "Xuất dữ liệu chi tiết dưới dạng cấu trúc JSON",
+    "-mc": "Lọc giữ lại theo Status Code (ví dụ: -mc 200,301,302)",
+    "-ml": "Lọc giữ lại theo Content Length (ví dụ: -ml 1234)",
+    "-path": "Thăm dò đường dẫn cụ thể trên tất cả danh sách URL (ví dụ: -path /admin)"
+  },
+  "agent_decision_heuristics": {
+    "quick_tech_probe": {
+      "condition": "Initial Recon Probe",
+      "recommended_options": {
+        "-sc": true,
+        "-title": true,
+        "-server": true,
+        "-td": true,
+        "-follow-redirects": true,
+        "-json": true
+      },
+      "rationale": "Quét nhanh lấy thông số Web Server, Page Title và Tech Stack chính xác dạng JSON."
+    },
+    "favicon_fingerprinting": {
+      "condition": "Identify Unknown CMS/Framework via Favicon",
+      "recommended_options": {
+        "-favicon": true,
+        "-json": true
+      },
+      "rationale": "Bóc tách mmh3 hash của Favicon để tra cứu fingerprint trong cơ sở dữ liệu."
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "tool_name": "arjun",
+  "category": "parameter_discovery",
+  "description": "Công cụ dò tìm tham số ẩn (HTTP Parameter Discovery) hỗ trợ GET, POST, JSON, XML APIs.",
+  "essential_options": {
+    "-u": "URL mục tiêu cần tìm tham số (ví dụ: https://example.com/api/v1/user)",
+    "-m": "Phương thức HTTP request (GET, POST, JSON, XML, mặc định: GET)",
+    "-w": "Đường dẫn file Wordlist tham số tùy chỉnh",
+    "-t": "Số lượng luồng song song (threads, mặc định: 5)",
+    "-d": "Độ trễ giữa các request (tính bằng giây) để né rate-limiting",
+    "-oJ": "Xuất kết quả phát hiện ra file JSON",
+    "-oT": "Xuất kết quả phát hiện ra file Text",
+    "-oB": "Xuất tham số tìm được sang Burp Suite Proxy",
+    "--headers": "Thêm HTTP Headers tùy chỉnh (ví dụ: Authorization / Cookie)",
+    "--passive": "Trích xuất tham số thụ động từ JS bundles và nguồn công khai mà không gửi request brute-force"
+  },
+  "agent_decision_heuristics": {
+    "get_param_discovery": {
+      "condition": "HTTP 200 GET Endpoint Analyzed",
+      "recommended_options": {
+        "-m": "GET",
+        "-t": 10,
+        "-oJ": "output_samples/arjun_params.json"
+      },
+      "rationale": "Dò tìm tham số GET ẩn bằng cách phân tích sự thay đổi trong response body & status code."
+    },
+    "json_api_param_discovery": {
+      "condition": "JSON API Endpoint Analyzed",
+      "recommended_options": {
+        "-m": "JSON",
+        "--headers": "Content-Type: application/json",
+        "-oJ": "output_samples/arjun_json_params.json"
+      },
+      "rationale": "Gửi payload dạng JSON để dò tìm các key/field ẩn trong REST/JSON APIs."
+    }
+  }
+}

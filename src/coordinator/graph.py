@@ -11,6 +11,7 @@ Cấu trúc graph:
     → fuzzing → 🧠D4 → [param_disc] → filter_404 → report → 🧠reflect → END
 """
 
+import os
 import json
 import uuid
 import logging
@@ -23,6 +24,7 @@ from .state import SharedState
 from .guards import CircuitBreaker, LLMCallLimiter, TarpitDetector
 from .decision_engine import DecisionEngine
 from .knowledge_store import KnowledgeStore
+from .logger import log_decision, log_agent_skip, log_pipeline_summary
 
 from ..agents.tech_recon import TechReconAgent
 from ..agents.wordlist_gen import WordlistGenAgent
@@ -62,10 +64,27 @@ def _get_decision_engine(config: dict = None) -> DecisionEngine:
 
     if _decision_engine is None:
         config = config or {}
-        llm = ChatOpenAI(
-            model=config.get("llm_model", "gpt-4o"),
-            temperature=config.get("llm_temperature", 0.1),
-        )
+        model_name = config.get("llm_model") or os.getenv("LLM_MODEL", "DeepSeek-V4.1-Flash")
+        temperature = config.get("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.1")))
+        
+        # Đọc API Key và Base URL (hỗ trợ cả DeepSeek và OpenAI)
+        api_key = config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL") or os.getenv("OPENAI_API_BASE")
+        
+        # Nếu chưa truyền base_url và dùng DeepSeek, đặt mặc định URL API của DeepSeek
+        if not base_url and (os.getenv("DEEPSEEK_API_KEY") or "deepseek" in model_name.lower()):
+            base_url = "https://api.deepseek.com"
+
+        kwargs = {
+            "model": model_name,
+            "temperature": temperature,
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        llm = ChatOpenAI(**kwargs)
         _knowledge_store = KnowledgeStore(
             base_dir=config.get("knowledge_store_dir", "knowledge_store")
         )
@@ -177,7 +196,8 @@ def run_tech_recon(state: dict) -> dict:
     })
 
     try:
-        agent = TechReconAgent()
+        engine = _get_decision_engine(state.get("config"))
+        agent = TechReconAgent(llm=engine.llm if engine else None)
         result = agent.execute(state["target_url"])
 
         state["tech_stack"] = result.get("tech_stack", {})
@@ -185,6 +205,7 @@ def run_tech_recon(state: dict) -> dict:
         state["js_endpoints"] = result.get("js_endpoints", [])
         state["waf_detected"] = result.get("waf_detected", False)
         state["waf_type"] = result.get("waf_type", None)
+        state.setdefault("subagent_justifications", {})["tech_recon"] = result.get("subagent_justification", "")
         state["agent_statuses"]["tech_recon"] = "success"
         circuit_breakers["tech_recon"].record_success()
 
@@ -218,10 +239,12 @@ def llm_decide_after_recon(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Tech Recon (Decision Point D2)."""
     engine = _get_decision_engine(state.get("config"))
 
+    subagent_just = state.get("subagent_justifications", {}).get("tech_recon", "")
     result_summary = (
         f"Tech stack: {json.dumps(state.get('tech_stack', {}))}. "
         f"Paths found: {len(state.get('discovered_paths', []))}. "
-        f"WAF: {state.get('waf_type', 'None')}."
+        f"WAF: {state.get('waf_type', 'None')}. "
+        f"Sub-Agent Justification: {subagent_just}"
     )
 
     decision = engine.make_decision(
@@ -230,6 +253,13 @@ def llm_decide_after_recon(state: dict) -> dict:
         completed_agent="tech_recon",
         agent_status=state["agent_statuses"]["tech_recon"],
         agent_result_summary=result_summary,
+    )
+
+    log_decision(
+        decision_point="after_tech_recon (D2)",
+        action=decision.get("action", "unknown"),
+        reasoning=decision.get("reasoning", "No reasoning provided"),
+        adjustments=decision.get("next_agent_config_adjustments")
     )
 
     state["_last_decision_action"] = decision["action"]
@@ -249,7 +279,8 @@ def run_wordlist_gen(state: dict) -> dict:
     })
 
     try:
-        agent = WordlistGenAgent()
+        engine = _get_decision_engine(state.get("config"))
+        agent = WordlistGenAgent(llm=engine.llm if engine else None)
         result = agent.execute(
             tech_stack=state["tech_stack"],
             discovered_paths=state["discovered_paths"],
@@ -261,6 +292,7 @@ def run_wordlist_gen(state: dict) -> dict:
         state["dev_profile"] = result.get("dev_profile")
         state["wordlist"] = result.get("wordlist", [])
         state["wordlist_metadata"] = result.get("metadata", {})
+        state.setdefault("subagent_justifications", {})["wordlist_gen"] = result.get("subagent_justification", "")
         state["agent_statuses"]["wordlist_gen"] = "success"
         circuit_breakers["wordlist_gen"].record_success()
 
@@ -292,8 +324,10 @@ def llm_decide_after_wordlist(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Wordlist Generation (Decision Point D3)."""
     engine = _get_decision_engine(state.get("config"))
 
+    subagent_just = state.get("subagent_justifications", {}).get("wordlist_gen", "")
     result_summary = (
-        f"Wordlist size: {len(state.get('wordlist', []))} entries."
+        f"Wordlist size: {len(state.get('wordlist', []))} entries. "
+        f"Sub-Agent Justification: {subagent_just}"
     )
 
     decision = engine.make_decision(
@@ -302,6 +336,13 @@ def llm_decide_after_wordlist(state: dict) -> dict:
         completed_agent="wordlist_gen",
         agent_status=state["agent_statuses"]["wordlist_gen"],
         agent_result_summary=result_summary,
+    )
+
+    log_decision(
+        decision_point="after_wordlist_gen (D3)",
+        action=decision.get("action", "unknown"),
+        reasoning=decision.get("reasoning", "No reasoning provided"),
+        adjustments=decision.get("next_agent_config_adjustments")
     )
 
     state["_last_decision_action"] = decision["action"]
@@ -324,7 +365,8 @@ def run_fuzzing(state: dict) -> dict:
     })
 
     try:
-        agent = FuzzingAgent()
+        engine = _get_decision_engine(state.get("config"))
+        agent = FuzzingAgent(llm=engine.llm if engine else None)
         result = agent.execute(
             target_url=state["target_url"],
             wordlist=state["wordlist"],
@@ -335,6 +377,7 @@ def run_fuzzing(state: dict) -> dict:
 
         state["raw_results"] = result.get("results", [])
         state["fuzzing_stats"] = result.get("stats", {})
+        state.setdefault("subagent_justifications", {})["fuzzing"] = result.get("subagent_justification", "")
         state["total_http_requests"] += result.get(
             "stats", {}
         ).get("total_requests", 0)
@@ -397,10 +440,12 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
         for r in state.get("raw_results", [])
         if r.get("status_code") == 200
     ]
+    subagent_just = state.get("subagent_justifications", {}).get("fuzzing", "")
     result_summary = (
         f"Total results: {len(state.get('raw_results', []))}. "
         f"HTTP 200: {len(http_200s)}. "
-        f"HTTP requests sent: {state.get('total_http_requests', 0)}."
+        f"HTTP requests sent: {state.get('total_http_requests', 0)}. "
+        f"Sub-Agent Justification: {subagent_just}"
     )
 
     decision = engine.make_decision(
@@ -411,9 +456,16 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
         agent_result_summary=result_summary,
     )
 
+    log_decision(
+        decision_point="after_fuzzing (D4)",
+        action=decision.get("action", "unknown"),
+        reasoning=decision.get("reasoning", "No reasoning provided"),
+        adjustments=decision.get("next_agent_config_adjustments")
+    )
+
     if decision["action"] == "skip_to_filter":
         state["agent_statuses"]["param_disc"] = "skipped"
-        logger.info("[Coordinator] LLM decided to SKIP param_disc")
+        log_agent_skip("ParamDiscoveryAgent", decision.get("reasoning", "LLM quyết định skip sang filter 404"))
 
     state["_last_decision_action"] = decision["action"]
     state["_config_adjustments"] = decision.get(
@@ -774,11 +826,23 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
     app = build_coordinator_graph()
     final_state = app.invoke(initial_state)
 
-    logger.info(
-        f"[Coordinator v2.0] Pipeline complete — "
-        f"Session: {final_state.get('session_id', '?')[:8]}... "
-        f"Verified: {len(final_state.get('verified_results', []))} "
-        f"Decisions: {len(final_state.get('decision_chain', []))}"
+    # Tính toán duration và log tổng kết
+    start_dt = datetime.fromisoformat(final_state.get("started_at", datetime.now(timezone.utc).isoformat()))
+    finish_dt = datetime.fromisoformat(final_state.get("finished_at", datetime.now(timezone.utc).isoformat()))
+    duration = (finish_dt - start_dt).total_seconds()
+
+    log_pipeline_summary(
+        session_id=final_state.get("session_id", "unknown"),
+        target_url=target_url,
+        duration_sec=max(duration, 0.0),
+        stats={
+            "verified_results": len(final_state.get("verified_results", [])),
+            "false_positives": len(final_state.get("false_positives", [])),
+            "llm_calls": final_state.get("llm_call_count", 0),
+            "http_requests": final_state.get("total_http_requests", 0),
+            "decisions_made": len(final_state.get("decision_chain", [])),
+            "agent_statuses": final_state.get("agent_statuses", {}),
+        }
     )
 
     return final_state

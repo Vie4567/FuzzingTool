@@ -1,0 +1,27 @@
+{
+  "tool_name": "katana",
+  "category": "web_crawling_and_js_parsing",
+  "description": "Công cụ Crawling & Parsing mã nguồn JS thế hệ mới từ ProjectDiscovery, phân tích đệ quy DOM, Endpoints và API Routes.",
+  "essential_options": {
+    "-u": "URL mục tiêu hoặc danh sách URL (-list file.txt)",
+    "-depth": "Độ sâu tối đa khi crawl liên kết đệ quy (mặc định: 2)",
+    "-js-crawl": "Bật tính năng phân tích và bóc tách đệ quy các file JavaScript (.js)",
+    "-known-files": "Tự động kiểm tra các file nhạy cảm phổ biến (robots.txt, sitemap.xml)",
+    "-automatic-form-fill": "Tự động điền dữ liệu giả lập vào các HTML Form để phát hiện luồng submit",
+    "-output": "File lưu kết quả xuất ra",
+    "-json": "Xuất kết quả dưới dạng dữ liệu JSON chi tiết",
+    "-rate-limit": "Giới hạn số request trên giây",
+    "-concurrency": "Số lượng luồng xử lý đồng thời (threads)"
+  },
+  "agent_decision_heuristics": {
+    "js_endpoint_extraction": {
+      "condition": "Deep JS Endpoint Extraction Required",
+      "recommended_options": {
+        "-js-crawl": true,
+        "-depth": 3,
+        "-json": true
+      },
+      "rationale": "Crawl sâu và bóc tách toàn bộ API Endpoints ẩn bên trong các JS Bundle."
+    }
+  }
+}
