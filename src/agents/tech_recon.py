@@ -68,11 +68,15 @@ _DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+from src.tools.auth_manager import AuthManager
 
 
-def _fetch_sync(url: str, timeout: int = 10) -> tuple[Optional[int], dict, str]:
+def _fetch_sync(url: str, timeout: int = 10, extra_headers: Optional[dict] = None) -> tuple[Optional[int], dict, str]:
     """Đồng bộ: trả (status, headers_dict, body_str). Lỗi → (None, {}, err_msg)."""
-    req = urllib.request.Request(url, headers={"User-Agent": _DEFAULT_UA})
+    headers = {"User-Agent": _DEFAULT_UA}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
             raw = resp.read()
@@ -88,10 +92,10 @@ def _fetch_sync(url: str, timeout: int = 10) -> tuple[Optional[int], dict, str]:
         return None, {}, str(exc)
 
 
-async def _fetch_async(url: str, timeout: int = 10) -> tuple[Optional[int], dict, str]:
+async def _fetch_async(url: str, timeout: int = 10, extra_headers: Optional[dict] = None) -> tuple[Optional[int], dict, str]:
     """Bất đồng bộ wrapper quanh _fetch_sync (chạy trong thread pool)."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _fetch_sync, url, timeout)
+    return await loop.run_in_executor(None, _fetch_sync, url, timeout, extra_headers)
 
 
 # ===========================================================================
@@ -379,7 +383,7 @@ class _ReconSpider:
     SPA_FRAMEWORKS = {"react", "vue", "angular", "svelte", "next_js", "nuxt_js"}
     SSR_FRAMEWORKS = {"wordpress", "drupal", "joomla", "django", "laravel", "symfony"}
 
-    def __init__(self, start_url: str, tech_hints: dict, spider_cfg: dict):
+    def __init__(self, start_url: str, tech_hints: dict, spider_cfg: dict, extra_headers: Optional[dict] = None):
         self.start_url = start_url
         self.parsed_base = urllib.parse.urlparse(start_url)
         self.base_domain = self.parsed_base.netloc
@@ -387,6 +391,7 @@ class _ReconSpider:
         self.limits = spider_cfg.get("limits", {})
         self.exclusions = spider_cfg.get("exclusion_patterns", [])
         self.priority_paths = spider_cfg.get("priority_paths", [])
+        self.extra_headers = extra_headers or {}
 
         self.max_depth = self._resolve_depth(tech_hints)
         self.max_pages = self._resolve_max_pages(tech_hints)
@@ -452,7 +457,7 @@ class _ReconSpider:
 
         async with self._sem:
             timeout = self.limits.get("request_timeout_ms", 8000) // 1000
-            status, headers, body = await _fetch_async(url, timeout=timeout)
+            status, headers, body = await _fetch_async(url, timeout=timeout, extra_headers=self.extra_headers)
 
         if not body or status is None:
             return
@@ -804,8 +809,20 @@ class TechReconAgent(BaseAutonomousAgent):
     Thực hiện recon tự chủ: Gọi tool, lập luận chọn tool & options, giải trình kết quả.
     """
 
-    def __init__(self, llm=None):
+    def __init__(
+        self,
+        llm=None,
+        auth_manager: Optional[AuthManager] = None,
+        cookie: Optional[str] = None,
+        bearer_token: Optional[str] = None,
+        account: Optional[dict] = None,
+    ):
         super().__init__(agent_name="TechReconAgent", llm=llm, tool_registry=default_registry)
+        self.auth_manager = auth_manager or AuthManager(
+            cookie=cookie,
+            bearer_token=bearer_token,
+            account=account
+        )
         self._knowledge_dir = Path("knowledge")
         self._fp_data: dict = {}
         self._waf_data: dict = {}
@@ -843,9 +860,14 @@ class TechReconAgent(BaseAutonomousAgent):
         self._load_knowledge()
         base_url = target_url.rstrip("/")
 
+        # Giải quyết header xác thực (Cách 2 / Cách 3 / Mặc định không truyền gì)
+        auth_headers = self.auth_manager.get_auth_headers(target_url)
+        if auth_headers:
+            log_agent_progress("TechReconAgent", f"🔐 Kích hoạt Auth Context ({list(auth_headers.keys())})")
+
         # ── CH-1 + CH-2 (homepage fetch) ──────────────────────────────
         log_agent_progress("TechReconAgent", "CH-1 & CH-2: Đang fetch homepage và phân tích Headers + DOM...")
-        status, headers, body = await _fetch_async(target_url, timeout=12)
+        status, headers, body = await _fetch_async(target_url, timeout=12, extra_headers=auth_headers)
 
         if status is None:
             raise RuntimeError(f"Không thể kết nối tới {target_url}: {body}")
@@ -872,7 +894,7 @@ class TechReconAgent(BaseAutonomousAgent):
         ch3_params: set = set()
         for js_path in js_script_paths:
             js_url = base_url + js_path if js_path.startswith("/") else js_path
-            _, _, js_body = await _fetch_async(js_url, timeout=8)
+            _, _, js_body = await _fetch_async(js_url, timeout=8, extra_headers=auth_headers)
             if js_body and len(js_body) < 5_000_000:  # skip >5MB
                 js_result = _ch3_js_analyze(js_body, self._js_patterns)
                 ch3_paths.update(js_result["paths"])
@@ -893,7 +915,7 @@ class TechReconAgent(BaseAutonomousAgent):
 
         # ── CH-4: Recursive Spider ─────────────────────────────────────
         log_agent_progress("TechReconAgent", "CH-4: Đang khởi động Crawl Spider (adaptive depth)...")
-        spider = _ReconSpider(target_url, early_hints, self._spider_cfg)
+        spider = _ReconSpider(target_url, early_hints, self._spider_cfg, extra_headers=auth_headers)
         ch4 = await spider.run()
 
         # ── CH-7: Error Probe ──────────────────────────────────────────

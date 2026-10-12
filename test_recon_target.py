@@ -5,22 +5,75 @@ import urllib.request
 import ssl
 import json
 import re
+import os
+import sys
+import argparse
 
-target_url = "https://ktxhcm.edu.vn/"
+# Nạp AuthManager hỗ trợ Cách 2 & Cách 3
+sys.path.insert(0, ".")
+from src.tools.auth_manager import AuthManager
+
+# Cấu hình đối số dòng lệnh hoặc tham số chạy
+parser = argparse.ArgumentParser(description="Test Recon with optional Authentication")
+parser.add_argument("--url", default="https://cab.vn/", help="Target URL")
+parser.add_argument("--cookie", default=os.getenv("TARGET_COOKIE", None), help="Manual Cookie (Cách 2)")
+parser.add_argument("--token", default=os.getenv("TARGET_TOKEN", None), help="Bearer Token (Cách 2)")
+parser.add_argument("--username", default=os.getenv("TARGET_USERNAME", None), help="Account username (Cách 3)")
+parser.add_argument("--password", default=os.getenv("TARGET_PASSWORD", None), help="Account password (Cách 3)")
+parser.add_argument("--login-url", default=os.getenv("TARGET_LOGIN_URL", None), help="Custom login URL (Cách 3)")
+args, _ = parser.parse_known_args()
+
+target_url = args.url
+cookie_input = args.cookie
+token_input = args.token
+
+account_input = None
+if args.username and args.password:
+    account_input = {
+        "username": args.username,
+        "password": args.password,
+        "login_url": args.login_url or ""
+    }
+
+# Khởi tạo AuthManager:
+# 1. Ưu tiên cookie/token nếu có (Cách 2)
+# 2. Nếu không có cookie thì dùng account để auto-login (Cách 3)
+# 3. Mặc định không truyền gì -> chạy unauthenticated (Black-box)
+auth_mgr = AuthManager(
+    cookie=cookie_input,
+    bearer_token=token_input,
+    account=account_input
+)
+
+auth_headers = auth_mgr.get_auth_headers(target_url)
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    req_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    # Tự động gộp auth headers nếu có
+    req_headers.update(auth_headers)
+    req = urllib.request.Request(url, headers=req_headers)
     try:
         with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
             return r.status, dict(r.headers), r.read().decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode('utf-8', errors='ignore')
+        except Exception:
+            body = ""
+        return e.code, dict(e.headers), body
     except Exception as e:
         return None, {}, str(e)
 
-print(f"[*] Starting Recon test for target: {target_url}\n")
+print(f"[*] Starting Recon test for target: {target_url}")
+if auth_headers:
+    print(f"[*] [AUTH ENABLED] Using Authenticated Headers: {list(auth_headers.keys())}")
+else:
+    print("[*] [AUTH DISABLED] Running in default Unauthenticated mode")
+print()
 
 status, headers, body = fetch(target_url)
 _, _, robots = fetch(target_url + "robots.txt")
@@ -62,14 +115,14 @@ for pattern, tech in fingerprints.get('body_patterns', {}).items():
     if pattern in body:
         body_detected.append(tech)
 
-# 4. JS Script tags extraction
+# 4. JS Script tags extraction & Deep Bundle Analysis (CH-3)
 script_srcs = re.findall(r'<script[^>]+src=[\"\']([^\"\']+)[\"\']', body, re.IGNORECASE)
 
 # 5. Extract links, paths, query parameters & forms
 discovered_paths = set()
 discovered_params = set()
 
-# Bóc tách hrefs và query parameters
+# Bóc tách hrefs và query parameters từ HTML
 for match in re.finditer(r'href=[\"\'](/[^\"\'\s>]+)[\"\']', body):
     raw_href = match.group(1)
     if raw_href.startswith(('//', 'http:', 'https:')):
@@ -84,6 +137,23 @@ for match in re.finditer(r'href=[\"\'](/[^\"\'\s>]+)[\"\']', body):
         clean_path = raw_href.split('#')[0]
         if clean_path:
             discovered_paths.add(clean_path)
+
+# CH-3: Bóc tách sâu API endpoints & Route ẩn trong tất cả các file JavaScript
+print(f"[*] Đang phân tích sâu {len(script_srcs)} file JavaScript bundles...")
+for s_path in script_srcs:
+    js_url = s_path if s_path.startswith("http") else urllib.parse.urljoin(target_url, s_path)
+    _, _, js_body = fetch(js_url)
+    if js_body and len(js_body) < 10_000_000:
+        # Bóc tách các API endpoint dạng /v1/..., /api/..., service router
+        js_endpoints = re.findall(r'[\"\'`](/(?:api|v[0-9]|auth|[a-zA-Z0-9_\-]+-service)/[a-zA-Z0-9_\-/]+)[\"\'`]', js_body)
+        for ep in js_endpoints:
+            clean_ep = ep.split("?")[0].rstrip("/")
+            if len(clean_ep) > 3:
+                discovered_paths.add(clean_ep)
+        # Bóc tách các tham số query trong JS
+        for p in re.findall(r'[\?&]([a-zA-Z0-9_\-]+)=', js_body):
+            if len(p) < 30:
+                discovered_params.add(p)
 
 # Bóc tách form actions & form inputs (input, select, textarea)
 forms = []
