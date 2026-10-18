@@ -1,12 +1,14 @@
 """
 Wordlist Generator Agent Module — Phase 2 Wordlist Generation & Developer Profiling.
 
-Thực hiện:
-1. Phân tích 8 chiều thói quen lập trình viên (Developer Habit Profile) bằng LLM.
-2. Dự đoán và sinh các endpoints tiềm năng (CRUD, Microservices, Auth) bằng LLM.
-3. Lọc qua Anti-Hallucination Filter.
-4. Tổng hợp Wordlist đa tầng (Framework/CMS wordlists + Sensitive files + Discovered paths + LLM Predictions).
-5. Xuất kết quả ra output_samples/target_profile.json và output_samples/02_wordlist_result.json.
+Thuc hien:
+1. Phan tich 8 chieu thoi quen lap trinh vien (Developer Habit Profile) bang LLM.
+2. Sinh cac endpoints tiem nang bang EndpointAssembler voi LLM component-by-component enrichment:
+   - Phan tich URL patterns -> extract tung thanh phan (service, resource, action, ...)
+   - Gui tung phan cho LLM sinh theo context (service cua domain nay la gi? resource nao thuong ton tai?)
+   - Merge ket qua va assemble bang cartesian product
+3. Tong hop Wordlist da tang (Framework/CMS wordlists + Sensitive files + Discovered paths + Assembler Endpoints).
+4. Xuat ket qua ra output_samples/target_profile.json va output_samples/02_wordlist_result.json.
 """
 
 import os
@@ -16,7 +18,6 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Tự động nạp file .env (hỗ trợ cả khi chưa cài python-dotenv)
 try:
     import dotenv
     dotenv.load_dotenv()
@@ -41,6 +42,9 @@ from src.coordinator.logger import (
     COLOR_RESET,
 )
 from src.agents.base_agent import BaseAutonomousAgent
+from src.agents.endpoint_assembler import EndpointAssembler
+from src.agents.sensitive_assembler import SensitiveFilesAssembler
+from src.agents.param_assembler import ParameterAssembler
 from src.tools.registry import default_registry
 
 try:
@@ -54,10 +58,9 @@ logger = logging.getLogger(__name__)
 
 
 class WordlistGenAgent(BaseAutonomousAgent):
-    """Wordlist Generator Agent — Phân tích Dev Profile & Sinh Wordlist tự chủ với LLM."""
+    """Wordlist Generator Agent — Phan tich Dev Profile & Sinh Wordlist tu chu voi LLM."""
 
     def __init__(self, llm=None):
-        # Tự động nạp LLM từ biến môi trường nếu không truyền vào
         if llm is None and _LANGCHAIN_AVAILABLE:
             api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
             base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -73,13 +76,13 @@ class WordlistGenAgent(BaseAutonomousAgent):
                         temperature=temperature,
                     )
                 except Exception as ex:
-                    logger.warning(f"[WordlistGenAgent] Không thể khởi tạo LLM: {ex}")
+                    logger.warning(f"[WordlistGenAgent] Khong the khoi tao LLM: {ex}")
 
         super().__init__(agent_name="WordlistGenAgent", llm=llm, tool_registry=default_registry)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # LLM ANALYSIS: 8 CHIỀU THÓI QUEN LẬP TRÌNH VIÊN (DEVELOPER PROFILING)
-    # ══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
+    # LLM ANALYSIS: 8 CHIEU THOI QUEN LAP TRINH VIEN (DEVELOPER PROFILING)
+    # ==========================================================================
 
     def _analyze_dev_profile_with_llm(
         self,
@@ -87,68 +90,66 @@ class WordlistGenAgent(BaseAutonomousAgent):
         discovered_paths: list,
         js_endpoints: list = None,
     ) -> dict:
-        """Sử dụng LLM phân tích 8 chiều thói quen của developer."""
+        """Su dung LLM phan tich 8 chieu thoi quen cua developer."""
         combined_paths = list(set((discovered_paths or []) + (js_endpoints or [])))
-        sample_paths = combined_paths[:60]  # Lấy mẫu đại diện tránh quá tải token
+        sample_paths = combined_paths[:60]
 
-        # Fallback profile theo rule nếu không có LLM
         fallback_profile = self._build_heuristic_dev_profile(tech_stack, combined_paths)
 
         if not self.llm:
             return fallback_profile
 
         prompt_system = (
-            "Bạn là Senior Security Architect & Code Auditor chuyên phân tích phong cách lập trình, "
-            "thói quen đặt tên và kiến trúc API của team phát triển web (Developer Habit Profiling).\n"
-            "Hãy phân tích danh sách các endpoint thực tế và trả về DUY NHẤT một chuỗi JSON chuẩn mô tả "
-            "DevProfile theo 8 chiều phân tích."
+            "Ban la Senior Security Architect & Code Auditor chuyen phan tich phong cach lap trinh, "
+            "thoi quen dat ten va kien truc API cua team phat trien web (Developer Habit Profiling).\n"
+            "Hay phan tich danh sach cac endpoint thuc te va tra ve DUY NHAT mot chuoi JSON chuan mo ta "
+            "DevProfile theo 8 chieu phan tich."
         )
 
         prompt_user = f"""
-DỮ LIỆU ĐẦU VÀO TỪ RECON:
+DU LIEU DAU VAO TU RECON:
 - Tech Stack: {json.dumps(tech_stack, ensure_ascii=False)}
-- Mẫu Endpoints phát hiện được:
+- Mau Endpoints phat hien duoc:
 {json.dumps(sample_paths, indent=2, ensure_ascii=False)}
 
-YÊU CẦU PHÂN TÍCH 8 CHIỀU:
-1. naming_convention: dominant style (kebab-case, snake_case, camelCase, flat) và tỷ lệ.
-2. url_hierarchy: phân cấp URL (nested, microservice, resource, flat), tiền tố chung (VD /v1/, /api/).
-3. versioning: cách quản lý version (/v1, /v2, query, none).
-4. pluralization: số nhiều (users, posts) hay số ít (user, post).
-5. crud_pattern: phong cách đặt tên hành động (RESTful, RPC kiểu add-group/get-posts, hay action suffix).
-6. microservices_detected: danh sách các microservices (VD: user-service, payment-service, group-service, auth).
-7. auth_pattern: cách đặt tên các route xác thực (accounts, verify, login).
-8. common_actions: các hành động phổ biến (add, update, delete, get, list, search, cancel).
+YEU CAU PHAN TICH 8 CHIEU:
+1. naming_convention: dominant style (kebab-case, snake_case, camelCase, flat).
+2. url_hierarchy: phan cap URL, tien to chung (VD /v1/, /api/).
+3. versioning: cach quan ly version (/v1, /v2, query, none).
+4. pluralization: so nhieu (users) hay so it (user).
+5. crud_pattern: RESTful, RPC hay action suffix.
+6. microservices_detected: danh sach microservices.
+7. auth_pattern: cach dat ten route xac thuc.
+8. common_actions: cac hanh dong pho bien.
 
-OUTPUT FORMAT: Trả về JSON theo định dạng sau (KHÔNG CÓ MARKDOWN HAY GIẢI THÍCH):
+OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
 {{
   "naming_convention": "kebab-case",
   "url_hierarchy": {{
     "style": "microservice-nested",
     "common_prefix": "/v1/",
-    "detected_services": ["user-service", "group-service", "payment-service", "identity-service"]
+    "detected_services": ["user-service", "group-service", "payment-service"]
   }},
   "versioning": "v1",
   "pluralization": "mixed",
   "crud_pattern": "action-based",
   "common_actions": ["add", "get", "cancel", "verify", "detail"],
-  "business_domain": "Mạng xã hội / Nền tảng dịch vụ",
+  "business_domain": "Mang xa hoi / Nen tang dich vu",
   "inferred_rules": [
-    "Dùng tiền tố /v1/<service-name>/<resource>/<action>",
-    "Hành động dùng dấu gạch nối kebab-case"
+    "Dung tien to /v1/<service-name>/<resource>/<action>",
+    "Hanh dong dung dau gach noi kebab-case"
   ]
 }}
 """
 
         try:
-            log_agent_progress("WordlistGenAgent", "🧠 Đang gọi LLM phân tích 8 chiều thói quen Developer Profile...")
+            log_agent_progress("WordlistGenAgent", "Dang goi LLM phan tich 8 chieu thoi quen Developer Profile...")
             response = self.llm.invoke([
                 SystemMessage(content=prompt_system),
                 HumanMessage(content=prompt_user),
             ])
             content = response.content.strip()
 
-            # Trích xuất JSON từ phản hồi LLM
             m = re.search(r'\{.*\}', content, re.DOTALL)
             if m:
                 llm_data = json.loads(m.group(0))
@@ -169,12 +170,12 @@ OUTPUT FORMAT: Trả về JSON theo định dạng sau (KHÔNG CÓ MARKDOWN HAY 
                 }
                 return dev_profile
         except Exception as ex:
-            logger.warning(f"[WordlistGenAgent] LLM Profiling gặp lỗi, sử dụng fallback: {ex}")
+            logger.warning(f"[WordlistGenAgent] LLM Profiling gap loi, su dung fallback: {ex}")
 
         return fallback_profile
 
     def _build_heuristic_dev_profile(self, tech_stack: dict, paths: list) -> dict:
-        """Xây dựng Dev Profile theo thống kê heuristic khi không có LLM."""
+        """Xay dung Dev Profile theo thong ke heuristic khi khong co LLM."""
         services = set()
         for p in paths:
             m = re.search(r'/v[0-9]+/([a-zA-Z0-9_\-]+-service)', p)
@@ -206,73 +207,150 @@ OUTPUT FORMAT: Trả về JSON theo định dạng sau (KHÔNG CÓ MARKDOWN HAY 
             }
         }
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # LLM PREDICTIVE MUTATION: SINH ENDPOINTS TIỀM NĂNG
-    # ══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
+    # ENDPOINT ASSEMBLER: SINH ENDPOINTS THEO TUNG PHAN (COMPONENT-BY-COMPONENT)
+    # ==========================================================================
 
-    def _generate_predicted_endpoints_with_llm(
-        self, dev_profile: dict, observed_paths: list
-    ) -> List[str]:
-        """Sử dụng LLM để suy luận và sinh các endpoints tiềm năng chưa được phát hiện."""
-        if not self.llm:
-            return []
+    def _run_endpoint_assembler(
+        self,
+        dev_profile: dict,
+        all_recon_paths: list,
+        max_endpoints: int = 2000,
+    ) -> dict:
+        """
+        Chay EndpointAssembler voi LLM component-by-component enrichment.
 
-        sample_paths = observed_paths[:40]
-        services = dev_profile.get("detected_services", [])
-        naming = dev_profile.get("naming_convention", "kebab-case")
+        Thay vi goi LLM 1 lan de sinh danh sach endpoint hoan chinh (de hallucination),
+        assembler se:
+          1. Phan tich cac URL patterns tu observed URLs -> extract parts.
+          2. Gui tung phan rieng biet cho LLM theo context:
+             - "Business domain nay co service nao?"       -> LLM sinh services
+             - "Voi service do, resource nao ton tai?"     -> LLM sinh resources
+             - "Voi resource do, action nao bi bo sot?"   -> LLM sinh actions
+             - "Sub-resource nao thuong gap?"              -> LLM sinh sub_resources
+          3. Merge ket qua LLM vao vocabulary roi assemble bang cartesian product.
 
-        prompt_system = (
-            "Bạn là chuyên gia Penetration Testing & API Fuzzing. "
-            "Dựa trên các API endpoints hiện có và thói quen của developer, hãy SUY LUẬN và SINH RA "
-            "danh sách các endpoints ẩn có khả năng tồn tại cao (CRUD operations còn thiếu, admin endpoints, "
-            "export, import, status, debug, internal services)."
+        Returns:
+            {"endpoints": List[str], "metadata": {"total": int, "llm_enriched": bool, ...}}
+        """
+        log_agent_progress(
+            "WordlistGenAgent",
+            "Khoi dong EndpointAssembler voi LLM component-by-component enrichment..."
+        )
+        assembler = EndpointAssembler()
+        result = assembler.assemble(
+            dev_profile=dev_profile,
+            observed_urls=all_recon_paths,
+            max_endpoints=max_endpoints,
+            llm=self.llm,
         )
 
-        prompt_user = f"""
-THÔNG TIN PHÂN TÍCH:
-- Naming Style: {naming}
-- Các Microservices đã phát hiện: {json.dumps(services)}
-- Mẫu endpoints quan sát được:
-{json.dumps(sample_paths, indent=2)}
+        enriched_info = result.get("metadata", {}).get("llm_enriched_parts", {})
+        total = result["metadata"].get("total", 0)
+        log_agent_progress(
+            "WordlistGenAgent",
+            f"Assembler sinh duoc {total} endpoints "
+            + (
+                f"(LLM bo sung: "
+                + ", ".join(f"{k}+{v}" for k, v in enriched_info.items())
+                + ")"
+                if enriched_info else "(khong co LLM enrichment)"
+            )
+        )
+        return result
 
-YÊU CẦU:
-1. Với mỗi microservice và resource quan sát được, hãy sinh các endpoints tương ứng còn thiếu:
-   Ví dụ: thấy /add-group -> sinh /delete-group, /update-group, /get-members, /leave-group.
-   Ví dụ: thấy /matched-profiles -> sinh /block-profile, /report-profile, /profile-settings.
-   Ví dụ: thấy /admin/publishers -> sinh /admin/users, /admin/analytics, /admin/logs, /admin/config.
-2. BẮT BUỘC tuân thủ đúng quy tắc đặt tên {naming} và cấu trúc tiền tố /v1/...
-3. Sinh khoảng 50 - 80 đường dẫn tiềm năng nhất.
+    # ==========================================================================
+    # SENSITIVE FILES ASSEMBLER: SINH FILE NHAY CAM THEO TUNG PHAN
+    # ==========================================================================
 
-OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu bằng /), KHÔNG CÓ GIẢI THÍCH:
-[
-  "/v1/group-service/group/delete-group",
-  "/v1/group-service/group/update-group",
-  "/v1/user-service/users/profile-settings"
-]
-"""
+    def _run_sensitive_assembler(
+        self,
+        target_url: str,
+        tech_stack: dict,
+        dev_profile: dict,
+        max_paths: int = 1500,
+    ) -> dict:
+        """
+        Chay SensitiveFilesAssembler voi LLM component-by-component enrichment:
+          - config_secrets: LLM sinh cac file cau hinh va credentials theo framework/tech
+          - backup_archives: LLM sinh ten backup va database dump theo target slug/domain
+          - admin_panels: LLM sinh trang quan tri noi bo va database console
+          - debug_telemetry: LLM sinh debug toolbars, error logs va API schema docs
+        """
+        log_agent_progress(
+            "WordlistGenAgent",
+            "Khoi dong SensitiveFilesAssembler voi LLM component-by-component enrichment..."
+        )
+        assembler = SensitiveFilesAssembler()
+        result = assembler.assemble(
+            target_url=target_url,
+            tech_stack=tech_stack,
+            dev_profile=dev_profile,
+            llm=self.llm,
+            max_paths=max_paths,
+        )
+        enriched_info = result.get("metadata", {}).get("enriched_counts", {})
+        total = result.get("metadata", {}).get("total", 0)
+        log_agent_progress(
+            "WordlistGenAgent",
+            f"SensitiveFilesAssembler sinh duoc {total} paths "
+            + (
+                f"(LLM bo sung: "
+                + ", ".join(f"{k}+{v}" for k, v in enriched_info.items())
+                + ")"
+                if sum(enriched_info.values()) > 0 else "(khong co LLM enrichment)"
+            )
+        )
+        return result
 
-        try:
-            log_agent_progress("WordlistGenAgent", "🔮 Đang dùng LLM suy luận các hidden API & Microservice endpoints...")
-            response = self.llm.invoke([
-                SystemMessage(content=prompt_system),
-                HumanMessage(content=prompt_user),
-            ])
-            content = response.content.strip()
-            m = re.search(r'\[.*\]', content, re.DOTALL)
-            if m:
-                predicted = json.loads(m.group(0))
-                # Anti-hallucination filter
-                valid_paths = [p for p in predicted if isinstance(p, str) and p.startswith("/") and " " not in p]
-                log_agent_progress("WordlistGenAgent", f"✨ LLM đã suy luận thành công {len(valid_paths)} endpoints tiềm năng!")
-                return valid_paths
-        except Exception as ex:
-            logger.warning(f"[WordlistGenAgent] Lỗi khi sinh predicted endpoints bằng LLM: {ex}")
+    # ==========================================================================
+    # PARAMETER ASSEMBLER: SINH PARAMETER WORDLIST THEO TUNG PHAN
+    # ==========================================================================
 
-        return []
+    def _run_parameter_assembler(
+        self,
+        dev_profile: dict,
+        all_recon_paths: list,
+        tech_stack: dict,
+        max_params: int = 500,
+    ) -> dict:
+        """
+        Chay ParameterAssembler voi LLM component-by-component enrichment:
+          - id_lookup: LLM sinh tham so dinh danh / uuid theo resource va domain
+          - pagination_sort: LLM sinh tham so phan trang, sort, date range theo framework
+          - business_fields: LLM sinh tham so nghiep vu thuc te theo business domain
+          - action_control: LLM sinh tham so dieu khien luong, redirect, format
+          - debug_security: LLM sinh tham so debug, admin override, SSRF/LFI injection
+        """
+        log_agent_progress(
+            "WordlistGenAgent",
+            "Khoi dong ParameterAssembler voi LLM component-by-component enrichment..."
+        )
+        assembler = ParameterAssembler()
+        result = assembler.assemble(
+            dev_profile=dev_profile,
+            observed_urls=all_recon_paths,
+            tech_stack=tech_stack,
+            llm=self.llm,
+            max_params=max_params,
+        )
+        enriched_info = result.get("metadata", {}).get("enriched_counts", {})
+        total = result.get("metadata", {}).get("total", 0)
+        log_agent_progress(
+            "WordlistGenAgent",
+            f"ParameterAssembler sinh duoc {total} parameters "
+            + (
+                f"(LLM bo sung: "
+                + ", ".join(f"{k}+{v}" for k, v in enriched_info.items())
+                + ")"
+                if sum(enriched_info.values()) > 0 else "(khong co LLM enrichment)"
+            )
+        )
+        return result
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # TỔNG HỢP WORDLIST ĐA TẦNG (4 LAYERS)
-    # ══════════════════════════════════════════════════════════════════════════
+    # ==========================================================================
+    # TONG HOP WORDLIST DA TANG (4 LAYERS)
+    # ==========================================================================
 
     def _generate_wordlist_internal(
         self,
@@ -280,7 +358,7 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
         discovered_paths: list,
         js_endpoints: list = None,
     ) -> dict:
-        """Sinh Wordlist đa tầng tối ưu hoá theo Target Profile."""
+        """Sinh Wordlist da tang toi uu hoa theo Target Profile."""
         backend = tech_stack.get("backend", tech_stack.get("backend_language", "unknown"))
         cms = tech_stack.get("cms", "unknown")
         all_recon_paths = list(set((discovered_paths or []) + (js_endpoints or [])))
@@ -288,23 +366,55 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
         log_agent_start("WordlistGenAgent", f"Target Profile (Backend: {backend}, Paths: {len(all_recon_paths)})")
 
         try:
-            # 1. Phân tích Developer Profile bằng LLM
+            # 1. Phan tich Developer Profile bang LLM
             dev_profile = self._analyze_dev_profile_with_llm(tech_stack, discovered_paths, js_endpoints)
 
-            # Lưu file target_profile.json
             output_dir = Path("output_samples")
             output_dir.mkdir(exist_ok=True)
             profile_file = output_dir / "target_profile.json"
             with open(profile_file, "w", encoding="utf-8") as f:
                 json.dump(dev_profile, f, indent=2, ensure_ascii=False)
-            agent_logger.info(f"💾 [TARGET PROFILE SAVED] -> {profile_file}")
+            agent_logger.info(f"[TARGET PROFILE SAVED] -> {profile_file}")
 
-            # 2. Sinh các endpoint tiềm năng bằng LLM (Layer 4 Predictive)
-            predicted_paths = self._generate_predicted_endpoints_with_llm(dev_profile, all_recon_paths)
+            # 2. EndpointAssembler: sinh endpoints theo tung thanh phan voi LLM enrichment
+            assembler_result = self._run_endpoint_assembler(
+                dev_profile=dev_profile,
+                all_recon_paths=all_recon_paths,
+                max_endpoints=2000,
+            )
+            assembler_endpoints = assembler_result.get("endpoints", [])
+            assembler_meta = assembler_result.get("metadata", {})
+
+            # 3. SensitiveFilesAssembler: sinh sensitive & backup files theo tung thanh phan voi LLM enrichment
+            target_url = tech_stack.get("target_url", "")
+            sensitive_result = self._run_sensitive_assembler(
+                target_url=target_url,
+                tech_stack=tech_stack,
+                dev_profile=dev_profile,
+                max_paths=1500,
+            )
+            sensitive_paths = sensitive_result.get("sensitive_files", [])
+            sensitive_meta = sensitive_result.get("metadata", {})
+
+            # 4. ParameterAssembler: sinh parameter wordlist theo tung thanh phan voi LLM enrichment
+            parameter_result = self._run_parameter_assembler(
+                dev_profile=dev_profile,
+                all_recon_paths=all_recon_paths,
+                tech_stack=tech_stack,
+                max_params=500,
+            )
+            parameter_wordlist = parameter_result.get("parameters", [])
+            parameter_meta = parameter_result.get("metadata", {})
+
+            # Luu parameter wordlist ra file rieng
+            param_file = output_dir / "02_parameter_wordlist.txt"
+            with open(param_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(parameter_wordlist))
+            agent_logger.info(f"[PARAMETER WORDLIST SAVED] -> {param_file} ({len(parameter_wordlist)} params)")
 
             wordlist_set = set()
 
-            # ── Layer 1: Knowledge Base Wordlists (Theo Framework/Tech) ──────
+            # Layer 1: Knowledge Base Wordlists (Theo Framework/Tech)
             knowledge_wl_dir = Path("knowledge/wordlists")
             if knowledge_wl_dir.exists():
                 target_keywords = []
@@ -321,25 +431,22 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
                         with open(wl_file, encoding="utf-8", errors="ignore") as f:
                             wordlist_set.update(line.strip() for line in f if line.strip() and not line.startswith("#"))
 
-            # ── Layer 2: Sensitive Files & Backup Wordlists ──────────────────
-            sensitive_file = Path("knowledge/sensitive_files.json")
-            if sensitive_file.exists():
-                with open(sensitive_file, encoding="utf-8") as f:
-                    sens_data = json.load(f)
-                    for category in sens_data.values():
-                        if isinstance(category, dict) and "paths" in category:
-                            wordlist_set.update(category["paths"])
+            # Layer 2: Sensitive Files & Backup Wordlists (Component-by-Component LLM Enriched)
+            for p in sensitive_paths:
+                if isinstance(p, str) and p.startswith("/"):
+                    wordlist_set.add(p)
 
-            # ── Layer 3: Toàn bộ Endpoints thu thập được từ Recon & JS ────────
+            # Layer 3: Toan bo Endpoints thu thap duoc tu Recon & JS
             for p in all_recon_paths:
                 if isinstance(p, str) and p.startswith("/"):
                     wordlist_set.add(p.split("?")[0])
 
-            # ── Layer 4: LLM Predictive Endpoints & Mutations ────────────────
-            for p in predicted_paths:
-                wordlist_set.add(p)
+            # Layer 4: Assembler Endpoints (LLM Component-by-Component)
+            for p in assembler_endpoints:
+                if isinstance(p, str) and p.startswith("/"):
+                    wordlist_set.add(p)
 
-            # Mutations (Thêm slash, biến thể backup cho file nhạy cảm)
+            # Mutations
             mutated_paths = set()
             for p in list(wordlist_set):
                 clean_p = p.rstrip("/")
@@ -348,26 +455,42 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
                     mutated_paths.add(clean_p + ".old")
 
             wordlist_set.update(mutated_paths)
-
             final_wordlist = sorted(list(wordlist_set))
 
             result = {
-                "target_url": tech_stack.get("target_url", ""),
+                "target_url": target_url,
                 "wordlist": final_wordlist,
+                "parameter_wordlist": parameter_wordlist,
+                "parameter_sample": parameter_wordlist[:20],
+                "parameter_metadata": parameter_meta,
                 "dev_profile": dev_profile,
-                "llm_predicted_count": len(predicted_paths),
-                "llm_predicted_sample": predicted_paths[:15],
+                "assembler_endpoints_count": len(assembler_endpoints),
+                "assembler_sample": assembler_endpoints[:15],
+                "assembler_metadata": assembler_meta,
+                "sensitive_files_count": len(sensitive_paths),
+                "sensitive_sample": sensitive_paths[:15],
+                "sensitive_metadata": sensitive_meta,
+                "llm_predicted_count": len(assembler_endpoints),
+                "llm_predicted_sample": assembler_endpoints[:15],
                 "metadata": {
                     "total_entries": len(final_wordlist),
                     "recon_paths_included": len(all_recon_paths),
-                    "llm_predicted_paths": len(predicted_paths),
+                    "assembler_endpoints": len(assembler_endpoints),
+                    "llm_predicted_paths": len(assembler_endpoints),
+                    "sensitive_paths_count": len(sensitive_paths),
+                    "parameter_entries": len(parameter_wordlist),
+                    "llm_enriched": assembler_meta.get("llm_enriched", False) or sensitive_meta.get("llm_enriched", False) or parameter_meta.get("llm_enriched", False),
+                    "llm_enriched_parts": assembler_meta.get("llm_enriched_parts", {}),
+                    "llm_enriched_sensitive": sensitive_meta.get("enriched_counts", {}),
+                    "llm_enriched_params": parameter_meta.get("enriched_counts", {}),
                     "target_profile_file": str(profile_file),
+                    "parameter_wordlist_file": str(param_file),
                 },
             }
             return result
 
         except Exception as e:
-            log_agent_error("WordlistGenAgent", "Thất bại khi sinh wordlist & Target Profile", exception=e)
+            log_agent_error("WordlistGenAgent", "That bai khi sinh wordlist & Target Profile", exception=e)
             raise e
 
     def execute(
@@ -377,14 +500,14 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
         js_endpoints: list = None,
         directive: dict = None,
     ) -> dict:
-        """Sinh Wordlist tự chủ với giải trình lý do (Autonomous Subagent)."""
+        """Sinh Wordlist tu chu voi giai trinh ly do (Autonomous Subagent)."""
         backend = tech_stack.get("backend", tech_stack.get("backend_language", "unknown"))
         cms = tech_stack.get("cms", "unknown")
 
         try:
             task_directive = directive or {
                 "task_id": "TASK_WORDLIST_001",
-                "objective": f"Phân tích DevProfile & sinh wordlist đa tầng thích ứng theo {backend}/{cms}.",
+                "objective": f"Phan tich DevProfile & sinh wordlist da tang thich ung theo {backend}/{cms}.",
                 "constraints": {"max_entries": 10000}
             }
 
@@ -399,40 +522,65 @@ OUTPUT FORMAT: Trả về danh sách JSON các đường dẫn (bắt đầu b�
                 execution_history=execution_history
             )
 
+            assembler_count = result.get("assembler_endpoints_count", result.get("llm_predicted_count", 0))
+            param_count = len(result.get("parameter_wordlist", []))
+            sensitive_count = result.get("sensitive_files_count", 0)
+
             tool_log_entry = {
                 "selected_tool": plan.get("selected_tool", "wordlist_generator_tool"),
                 "options": plan.get("options", {"cms": cms, "backend": backend}),
-                "tool_selection_reason": plan.get("tool_selection_reason", "Chọn wordlist_generator_tool kết hợp phân tích LLM 8 chiều và mutation."),
-                "options_selection_reason": plan.get("options_selection_reason", "Kích hoạt 4 Layer: Framework, Sensitive files, Recon paths và LLM Predictions."),
-                "result_summary": f"Đã sinh {len(result['wordlist'])} wordlist entries (gồm {result['llm_predicted_count']} paths do LLM suy luận)."
+                "tool_selection_reason": plan.get(
+                    "tool_selection_reason",
+                    "Chon wordlist_generator_tool ket hop phan tich LLM 8 chieu va component-by-component enrichment cho Endpoints, Sensitive Files va Parameters."
+                ),
+                "options_selection_reason": plan.get(
+                    "options_selection_reason",
+                    "Kich hoat 4 Layer: Framework, Sensitive Files Assembler, Recon paths, va Endpoint/Parameter Assemblers."
+                ),
+                "result_summary": (
+                    f"Da sinh {len(result['wordlist'])} wordlist paths "
+                    f"(assembler: {assembler_count} endpoints, sensitive: {sensitive_count} paths) "
+                    f"va {param_count} parameters."
+                )
             }
             execution_history.append(tool_log_entry)
 
             justification = self.generate_justification(
                 task_directive=task_directive,
                 execution_history=execution_history,
-                extracted_data={"total_entries": len(result['wordlist']), "predicted": result['llm_predicted_count']}
+                extracted_data={
+                    "total_entries": len(result['wordlist']),
+                    "assembler_endpoints": assembler_count,
+                    "sensitive_files": sensitive_count,
+                    "parameters_generated": param_count,
+                }
             )
 
             result["tools_executed"] = execution_history
             result["subagent_justification"] = justification
 
-            # Ghi kết quả Wordlist ra output_samples/02_wordlist_result.json
             output_file = Path("output_samples/02_wordlist_result.json")
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
+            meta = result.get("metadata", {})
             log_agent_success(
                 "WordlistGenAgent",
-                f"Đã sinh {len(result['wordlist'])} wordlist entries (đã lưu vào {output_file}).",
+                f"Da sinh {len(result['wordlist'])} wordlist paths "
+                f"(assembler: {assembler_count}, sensitive: {sensitive_count}) "
+                f"va {param_count} parameters "
+                f"(LLM enriched: {meta.get('llm_enriched', False)}, da luu vao {output_file}).",
                 metrics={
                     "total_entries": len(result['wordlist']),
-                    "llm_predictions": result['llm_predicted_count'],
+                    "assembler_endpoints": assembler_count,
+                    "sensitive_files": sensitive_count,
+                    "parameters": param_count,
+                    "llm_enriched": meta.get("llm_enriched", False),
                     "file": str(output_file),
                 }
             )
             return result
 
         except Exception as e:
-            log_agent_error("WordlistGenAgent", "Thất bại khi thực thi WordlistGenAgent", exception=e)
+            log_agent_error("WordlistGenAgent", "That bai khi thuc thi WordlistGenAgent", exception=e)
             raise e

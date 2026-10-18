@@ -337,13 +337,28 @@ def _ch2_dom_parse(body: str, base_url: str, fp_data: dict) -> dict:
 # CH-3: JavaScript Bundle Analysis
 # ===========================================================================
 
-def _ch3_js_analyze(js_body: str, js_patterns: dict) -> dict:
+THIRD_PARTY_IGNORE = {
+    "google-analytics.com", "googletagmanager.com", "google.com", "gstatic.com",
+    "facebook.com", "facebook.net", "fbcdn.net",
+    "twitter.com", "twimg.com",
+    "cdnjs.cloudflare.com", "cdn.jsdelivr.net", "unpkg.com",
+    "w3.org", "schema.org", "github.com",
+    "sentry.io", "datadoghq.com", "mixpanel.com",
+}
+
+
+def _ch3_js_analyze(js_body: str, js_patterns: dict, base_domain: str = "") -> dict:
     """
     Áp dụng tất cả regex pattern từ js_extraction_patterns.json để trích
-    xuất paths và endpoints từ nội dung JS bundle.
+    xuất paths, endpoints và backend API origins từ nội dung JS bundle.
     """
     found_paths: set = set()
     found_params: set = set()
+    found_api_origins: set = set()
+
+    clean_base = base_domain.lower().split(":")[0] if base_domain else ""
+    parts = clean_base.split(".")
+    root_domain = ".".join(parts[-2:]) if len(parts) >= 2 else clean_base
 
     for category, cat_data in js_patterns.items():
         if category == "_meta":
@@ -358,10 +373,29 @@ def _ch3_js_analyze(js_body: str, js_patterns: dict) -> dict:
                         found_paths.add(val.split("?")[0].split("#")[0])
                     elif val.startswith("http"):
                         parsed = urllib.parse.urlparse(val)
+                        if parsed.netloc:
+                            domain_lower = parsed.netloc.lower()
+                            if not any(tp in domain_lower for tp in THIRD_PARTY_IGNORE):
+                                is_domain_related = bool(root_domain and (root_domain in domain_lower))
+                                has_api_kw = any(k in domain_lower for k in ("api", "backend", "gateway", "svc", "service", "hub"))
+                                if is_domain_related or has_api_kw:
+                                    found_api_origins.add(f"{parsed.scheme}://{parsed.netloc}")
                         if parsed.path and parsed.path != "/":
-                            found_paths.add(parsed.path)
+                            found_paths.add(parsed.path.split("?")[0].split("#")[0])
             except re.error:
                 continue
+
+    # Quét thêm các full API URL / BaseURL cấu hình trong JS
+    api_url_re = re.compile(r'https?://[a-zA-Z0-9_\-\.]+(?::\d+)?', re.IGNORECASE)
+    for m in api_url_re.finditer(js_body):
+        candidate_url = m.group(0)
+        parsed = urllib.parse.urlparse(candidate_url)
+        domain_lower = parsed.netloc.lower()
+        if domain_lower and not any(tp in domain_lower for tp in THIRD_PARTY_IGNORE):
+            is_domain_related = bool(root_domain and (root_domain in domain_lower))
+            has_api_kw = any(k in domain_lower for k in ("api", "backend", "gateway", "svc", "hub"))
+            if is_domain_related and has_api_kw:
+                found_api_origins.add(f"{parsed.scheme}://{parsed.netloc}")
 
     # Tìm thêm param names từ query string patterns trong JS
     for qs_match in re.finditer(r'[?&]([a-zA-Z_][a-zA-Z0-9_]{1,30})=', js_body):
@@ -370,7 +404,9 @@ def _ch3_js_analyze(js_body: str, js_patterns: dict) -> dict:
     return {
         "paths": list(found_paths),
         "params": list(found_params),
+        "api_origins": list(found_api_origins),
     }
+
 
 
 # ===========================================================================
@@ -539,7 +575,7 @@ def _parse_sitemap(content: str) -> list[str]:
 
 
 async def _ch5_probe(base_url: str) -> dict:
-    """Probe danh sách file nhạy cảm, parse robots + sitemap."""
+    """Probe danh sách file nhạy cảm, parse robots + sitemap với kiểm tra loại bỏ SPA False Positive."""
     result: dict = {
         "paths": [],
         "params": [],
@@ -549,28 +585,57 @@ async def _ch5_probe(base_url: str) -> dict:
         "api_schema_urls": [],
     }
     base = base_url.rstrip("/")
+    sem = asyncio.Semaphore(3)
 
     async def _probe(probe_path: str):
         url = base + probe_path
-        status, _, body = await _fetch_async(url, timeout=8)
-        if status not in (200, 301, 302):
-            return
+        async with sem:
+            status, _, body = await _fetch_async(url, timeout=8)
+            if status not in (200, 301, 302) or not body:
+                return
 
-        result["probe_hits"].append(probe_path)
+            stripped = body.strip().lower()
+            is_html = stripped.startswith(("<!doctype html", "<html")) or "<body" in stripped[:200]
 
-        if probe_path == "/robots.txt":
-            result["has_robots_txt"] = True
-            result["paths"].extend(_parse_robots(body))
-        elif probe_path in ("/sitemap.xml", "/sitemap_index.xml"):
-            result["has_sitemap"] = True
-            result["paths"].extend(_parse_sitemap(body))
-        elif probe_path in (
-            "/swagger.json", "/swagger.yaml", "/openapi.json",
-            "/openapi.yaml", "/api-docs", "/api/swagger.json"
-        ):
-            result["api_schema_urls"].append(url)
-        elif probe_path in ("/graphql", "/graphiql"):
-            result["api_schema_urls"].append(url)
+            # Loại trừ SPA HTML fallback (khi server Nginx rewrite mọi route không tồn tại về index.html)
+            if probe_path in (
+                "/swagger.json", "/swagger.yaml", "/openapi.json", "/openapi.yaml",
+                "/api-docs", "/api/swagger.json", "/.env", "/.git/config",
+                "/package.json", "/composer.json", "/Gemfile"
+            ) and is_html:
+                return
+
+            if probe_path == "/robots.txt":
+                if not is_html and any(k in stripped for k in ("user-agent", "disallow", "allow")):
+                    result["probe_hits"].append(probe_path)
+                    result["has_robots_txt"] = True
+                    result["paths"].extend(_parse_robots(body))
+                return
+
+            if probe_path in ("/sitemap.xml", "/sitemap_index.xml"):
+                if not is_html and ("<loc>" in stripped or "<urlset" in stripped or "<sitemap" in stripped):
+                    result["probe_hits"].append(probe_path)
+                    result["has_sitemap"] = True
+                    result["paths"].extend(_parse_sitemap(body))
+                return
+
+            if probe_path in (
+                "/swagger.json", "/swagger.yaml", "/openapi.json",
+                "/openapi.yaml", "/api-docs", "/api/swagger.json"
+            ):
+                if not is_html and any(k in stripped for k in ("swagger", "openapi", "paths")):
+                    result["probe_hits"].append(probe_path)
+                    result["api_schema_urls"].append(url)
+                return
+
+            if probe_path in ("/graphql", "/graphiql"):
+                if not is_html or "graphql" in stripped:
+                    result["probe_hits"].append(probe_path)
+                    result["api_schema_urls"].append(url)
+                return
+
+            if not is_html:
+                result["probe_hits"].append(probe_path)
 
     tasks = [_probe(p) for p in PROBE_FILES]
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -890,17 +955,26 @@ class TechReconAgent(BaseAutonomousAgent):
         # Giới hạn số JS để tránh quá nhiều request
         js_script_paths = js_script_paths[:20]
 
+        parsed_target = urllib.parse.urlparse(target_url)
+        target_domain = parsed_target.netloc
+
         ch3_paths: set = set()
         ch3_params: set = set()
+        ch3_api_origins: set = set()
         for js_path in js_script_paths:
             js_url = base_url + js_path if js_path.startswith("/") else js_path
-            _, _, js_body = await _fetch_async(js_url, timeout=8, extra_headers=auth_headers)
+            _, _, js_body = await _fetch_async(js_url, timeout=15, extra_headers=auth_headers)
             if js_body and len(js_body) < 5_000_000:  # skip >5MB
-                js_result = _ch3_js_analyze(js_body, self._js_patterns)
+                js_result = _ch3_js_analyze(js_body, self._js_patterns, base_domain=target_domain)
                 ch3_paths.update(js_result["paths"])
                 ch3_params.update(js_result["params"])
+                ch3_api_origins.update(js_result.get("api_origins", []))
 
-        ch3 = {"paths": list(ch3_paths), "params": list(ch3_params)}
+        ch3 = {
+            "paths": list(ch3_paths),
+            "params": list(ch3_params),
+            "api_origins": list(ch3_api_origins),
+        }
 
         # ── CH-5: Probe Security Files ─────────────────────────────────
         log_agent_progress("TechReconAgent", "CH-5: Đang probe robots.txt, sitemap.xml, swagger, .env...")
@@ -961,10 +1035,62 @@ class TechReconAgent(BaseAutonomousAgent):
         if ch7.get("confirmed_framework"):
             final_tech["confirmed_by_error_probe"] = ch7["confirmed_framework"]
 
+        # ── Architecture Resolution (Decoupled SPA vs Monolith) ────────
+        target_origin = f"{parsed_target.scheme}://{parsed_target.netloc}".lower()
+        backend_api_hosts = [
+            origin for origin in sorted(ch3_api_origins)
+            if origin.lower().rstrip("/") != target_origin
+        ]
+
+        primary_backend_api = backend_api_hosts[0] if backend_api_hosts else base_url
+        is_spa = bool(
+            cms_info.get("cms") in ("React", "Vue.js", "Angular", "Next.js", "Nuxt.js")
+            or any(h in ("react", "vue_js", "angular", "next_js", "nuxt_js") for h in ch2.get("cms_hints", []))
+        )
+
+        arch_type = "monolithic"
+        if backend_api_hosts:
+            arch_type = "decoupled_spa" if is_spa else "decoupled_api"
+        elif is_spa:
+            arch_type = "monolithic_spa"
+
+        architecture = {
+            "type": arch_type,
+            "frontend_origin": base_url,
+            "backend_api_hosts": backend_api_hosts,
+            "primary_backend_api": primary_backend_api,
+            "is_decoupled": bool(backend_api_hosts),
+        }
+
+        # Nếu phát hiện decoupled backend API khác frontend, probe backend API để nhận diện server / headers
+        if backend_api_hosts:
+            log_agent_progress("TechReconAgent", f"Phát hiện Decoupled Backend API: {primary_backend_api}. Đang probe dấu vết backend...")
+            b_status, b_headers, _ = await _fetch_async(primary_backend_api + "/", timeout=8)
+            architecture["backend_probe"] = {
+                "status_code": b_status,
+                "server": b_headers.get("server") or b_headers.get("Server"),
+                "www_authenticate": b_headers.get("www-authenticate") or b_headers.get("WWW-Authenticate"),
+                "cors_allow_origin": b_headers.get("access-control-allow-origin") or b_headers.get("Access-Control-Allow-Origin"),
+            }
+
+        # Phân tách Backend API Endpoints vs Frontend Client-side Routes
+        API_PREFIXES = ("/v1/", "/v2/", "/v3/", "/v4/", "/api/", "/common/", "/hub", "/hubs", "/service/", "/auth/")
+        backend_api_endpoints = []
+        frontend_routes = []
+        for p in aggregated["paths"]:
+            if any(p.startswith(pref) for pref in API_PREFIXES) or "-service/" in p:
+                backend_api_endpoints.append(p)
+            else:
+                frontend_routes.append(p)
+
         # ── Build result (theo output schema từ design doc) ────────────
         result = {
             "target_url": target_url,
             "status_code": status,
+            "architecture": architecture,
+            "primary_backend_api": primary_backend_api,
+            "backend_api_endpoints": sorted(backend_api_endpoints),
+            "frontend_routes": sorted(frontend_routes),
 
             "tech_fingerprint": {
                 "web_server":   final_tech.get("web_server"),
@@ -974,6 +1100,8 @@ class TechReconAgent(BaseAutonomousAgent):
                 "waf_detected": ch1["waf_detected"],
                 "waf_type":     ch1["waf_type"],
                 "waf_evasion_hints": ch1["waf_evasion_hints"],
+                "architecture_type": arch_type,
+                "backend_api_hosts": backend_api_hosts,
             },
 
             # Legacy keys cho backward compat với coordinator
@@ -1007,6 +1135,9 @@ class TechReconAgent(BaseAutonomousAgent):
             "recon_stats": {
                 "total_paths_discovered":  aggregated["total_paths_discovered"],
                 "total_params_discovered": aggregated["total_params_discovered"],
+                "backend_endpoints_count": len(backend_api_endpoints),
+                "frontend_routes_count":   len(frontend_routes),
+                "backend_api_hosts_count": len(backend_api_hosts),
                 "spider_pages_visited":    ch4.get("pages_visited", 0),
                 "spider_depth_used":       ch4.get("depth_used", 0),
                 "js_files_analyzed":       len(js_script_paths),

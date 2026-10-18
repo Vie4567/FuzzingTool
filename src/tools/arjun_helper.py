@@ -70,6 +70,10 @@ class ArjunToolHelper(BaseToolHelper):
             if delay:
                 cmd.extend(["-d", str(delay)])
 
+            param_wl = kwargs.get("wordlist") or Path("output_samples/02_parameter_wordlist.txt")
+            if param_wl and Path(param_wl).exists():
+                cmd.extend(["-w", str(param_wl)])
+
             logger.info(f"🚀 [EXECUTING ARJUN CLI COMMAND] -> {' '.join(cmd)}")
 
             try:

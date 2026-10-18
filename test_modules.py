@@ -6,9 +6,21 @@ Mỗi module khi chạy sẽ tự động đọc dữ liệu đầu vào từ fi
 sau đó ghi kết quả đầu ra thành file JSON riêng trong thư mục `output_samples/`.
 """
 
+import sys
+import subprocess
+from pathlib import Path
+
+# Tự động chuyển sang môi trường .venv nếu chạy bằng Python toàn cục bị thiếu thư viện
+_venv_py = Path(".venv") / "Scripts" / "python.exe"
+if _venv_py.exists() and Path(sys.executable).resolve() != _venv_py.resolve():
+    try:
+        import langchain_core
+    except ImportError:
+        res = subprocess.run([str(_venv_py)] + sys.argv, check=False)
+        sys.exit(res.returncode)
+
 import json
 import os
-from pathlib import Path
 
 from src.agents.tech_recon import TechReconAgent
 from src.agents.wordlist_gen import WordlistGenAgent
@@ -77,23 +89,37 @@ def run_module_2() -> dict:
 
 
 def run_module_3() -> dict:
-    """Module 3: Fuzzing Agent."""
-    print("\n[3/5] Running Fuzzing Agent...")
+    """Module 3: Fuzzing Agent (với Pattern Engine từ dev_profile + observed URLs)."""
+    print("\n[3/5] Running Fuzzing Agent (+ Pattern Engine)...")
     recon_data = load_json(FILE_M1)
     wordlist_data = load_json(FILE_M2)
-    
-    target_url = recon_data.get("target_url", DEFAULT_TARGET)
+
+    # Nếu target là kiến trúc Decoupled, ưu tiên fuzzing trên primary_backend_api
+    target_url = recon_data.get("primary_backend_api") or recon_data.get("target_url", DEFAULT_TARGET)
     wordlist = wordlist_data.get("wordlist", [])
-    
+
+    # Dev profile từ WordlistGenAgent (chứa naming_convention, detected_services,...)
+    dev_profile = wordlist_data.get("dev_profile", {})
+
+    # Observed URLs từ recon: discovered_paths + js_endpoints (để Pattern Engine học vocab)
+    observed_urls = list(set(
+        recon_data.get("discovered_paths", []) +
+        recon_data.get("js_endpoints", [])
+    ))
+
     agent = FuzzingAgent()
     result = agent.execute(
         target_url=target_url,
         wordlist=wordlist,
         waf_detected=recon_data.get("waf_detected", False),
         waf_type=recon_data.get("waf_type", None),
+        dev_profile=dev_profile,
+        observed_urls=observed_urls,
+        use_pattern_engine=True,
+        max_pattern_endpoints=1500,
     )
     result["target_url"] = target_url
-    
+
     save_json(FILE_M3, result)
     return result
 
@@ -104,7 +130,8 @@ def run_module_4() -> dict:
     recon_data = load_json(FILE_M1)
     fuzzing_data = load_json(FILE_M3)
     
-    target_url = recon_data.get("target_url", DEFAULT_TARGET)
+    # Nếu target là kiến trúc Decoupled, ưu tiên khám phá param trên primary_backend_api
+    target_url = recon_data.get("primary_backend_api") or recon_data.get("target_url", DEFAULT_TARGET)
     raw_results = fuzzing_data.get("results", [])
     
     # Lọc lấy các endpoints HTTP 200 từ fuzzing
@@ -112,13 +139,21 @@ def run_module_4() -> dict:
     
     # Nếu không có HTTP 200 nào, lấy tạm 2 kết quả mẫu để test
     if not endpoints_200:
-        endpoints_200 = raw_results[:2] if raw_results else [{"path": "/api/v1/users", "status_code": 200}]
+        endpoints_200 = raw_results[:2] if raw_results else [{"path": "/v1/user-service/users/profile", "status_code": 200}]
+
+    dev_profile = {}
+    if FILE_M2.exists():
+        try:
+            dev_profile = load_json(FILE_M2).get("dev_profile", {})
+        except Exception:
+            pass
 
     agent = ParamDiscoveryAgent()
     result = agent.execute(
         target_url=target_url,
         endpoints=endpoints_200,
         tech_stack=recon_data.get("tech_stack", {}),
+        dev_profile=dev_profile,
     )
     result["target_url"] = target_url
     
@@ -132,7 +167,7 @@ def run_module_5() -> dict:
     recon_data = load_json(FILE_M1)
     fuzzing_data = load_json(FILE_M3)
     
-    target_url = recon_data.get("target_url", DEFAULT_TARGET)
+    target_url = recon_data.get("primary_backend_api") or recon_data.get("target_url", DEFAULT_TARGET)
     raw_results = fuzzing_data.get("results", [])
     
     agent = Soft404FilterAgent()
@@ -146,9 +181,12 @@ def run_module_5() -> dict:
     return result
 
 
-def run_all():
-    """Chạy toàn bộ từ m1 -> m5."""
-    run_module_1()
+def run_all(target_url: str = None, token: str = None, cookie: str = None):
+    """Chạy toàn bộ từ m1 -> m5 hoặc từ m2 -> m5 nếu m1 đã có dữ liệu."""
+    if target_url:
+        run_module_1(target_url=target_url, token=token, cookie=cookie)
+    elif not FILE_M1.exists():
+        run_module_1()
     run_module_2()
     run_module_3()
     run_module_4()
@@ -157,27 +195,25 @@ def run_all():
 
 
 if __name__ == "__main__":
-    import sys
-    
-    arg = sys.argv[1] if len(sys.argv) > 1 else "all"
-    
-    if arg == "m1":
-        run_module_1()
-    elif arg == "m2":
+    import argparse
+    parser = argparse.ArgumentParser(description="Test runner for Sentinel Agents")
+    parser.add_argument("mode", nargs="?", default="all", choices=["m1", "m2", "m3", "m4", "m5", "all", "pipeline"], help="Module to run")
+    parser.add_argument("--url", default=None, help="Target URL override")
+    parser.add_argument("--token", default=None, help="Bearer token for authenticated recon/fuzzing")
+    parser.add_argument("--cookie", default=None, help="Cookie header")
+    args = parser.parse_args()
+
+    mode = args.mode
+    if mode == "m1":
+        run_module_1(target_url=args.url or DEFAULT_TARGET, token=args.token, cookie=args.cookie)
+    elif mode == "m2":
         run_module_2()
-    elif arg == "m3":
+    elif mode == "m3":
         run_module_3()
-    elif arg == "m4":
+    elif mode == "m4":
         run_module_4()
-    elif arg == "m5":
+    elif mode == "m5":
         run_module_5()
-    elif arg == "all":
-        run_all()
-    else:
-        print("Cú pháp sử dụng:")
-        print("  python test_modules.py all  : Chạy toàn bộ 5 module theo thứ tự")
-        print("  python test_modules.py m1   : Chạy Module 1 (Tech Recon)")
-        print("  python test_modules.py m2   : Chạy Module 2 (Wordlist Gen)")
-        print("  python test_modules.py m3   : Chạy Module 3 (Fuzzing)")
-        print("  python test_modules.py m4   : Chạy Module 4 (Param Discovery)")
-        print("  python test_modules.py m5   : Chạy Module 5 (Soft 404 Filter)")
+    elif mode in ("all", "pipeline"):
+        run_all(target_url=args.url, token=args.token, cookie=args.cookie)
+

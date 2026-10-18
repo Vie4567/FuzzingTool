@@ -489,11 +489,13 @@ def run_param_discovery(state: dict) -> dict:
             for r in state.get("raw_results", [])
             if r.get("status_code") == 200
         ]
-        agent = ParamDiscoveryAgent()
+        engine = _get_decision_engine(state.get("config"))
+        agent = ParamDiscoveryAgent(llm=engine.llm if engine else None)
         result = agent.execute(
             target_url=state["target_url"],
             endpoints=http_200_endpoints,
             tech_stack=state.get("tech_stack", {}),
+            dev_profile=state.get("dev_profile"),
         )
 
         llm_limiter.record_call()

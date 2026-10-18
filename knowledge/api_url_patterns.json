@@ -1,0 +1,196 @@
+﻿{
+  "_meta": {
+    "description": "Thư viện các URL pattern templates cho Endpoint Assembler trong phase Fuzzing.",
+    "version": "1.0",
+    "usage": "endpoint_assembler.py → FuzzingAgent → lắp ráp endpoints từ dev_profile",
+    "parts_schema": {
+      "prefix": "Phiên bản API hoặc tiền tố cố định (VD: /v1, /api/v2, /api)",
+      "service": "Tên microservice hoặc module (VD: user-service, payments, auth)",
+      "resource": "Tài nguyên chính (VD: users, orders, products)",
+      "sub_resource": "Tài nguyên con hoặc mối quan hệ (VD: comments, members, roles)",
+      "action": "Hành động hoặc operation (VD: login, export, verify, search)",
+      "id_param": "Placeholder đại diện cho ID động (VD: {id}, {uuid}, 1, 123)"
+    }
+  },
+  "patterns": {
+    "rest_microservice_nested": {
+      "label": "REST Microservice Nested",
+      "description": "Pattern chuẩn microservice: /prefix/service/resource/action",
+      "template": "{prefix}/{service}/{resource}/{action}",
+      "parts": ["prefix", "service", "resource", "action"],
+      "examples": ["/v1/user-service/users/profile", "/v1/group-service/groups/members", "/v1/payment-service/orders/cancel"],
+      "confidence_score": 0.95
+    },
+    "rest_microservice_id_action": {
+      "label": "REST Microservice với ID + Action",
+      "description": "Pattern có ID tài nguyên rồi action: /prefix/service/resource/{id}/action",
+      "template": "{prefix}/{service}/{resource}/{id_param}/{action}",
+      "parts": ["prefix", "service", "resource", "id_param", "action"],
+      "examples": ["/v1/user-service/users/123/update", "/v1/group-service/groups/456/leave"],
+      "confidence_score": 0.90
+    },
+    "rest_versioned_resource": {
+      "label": "REST Versioned Resource (không service)",
+      "description": "Pattern đơn giản versioned: /prefix/resource/action",
+      "template": "{prefix}/{resource}/{action}",
+      "parts": ["prefix", "resource", "action"],
+      "examples": ["/v1/users/login", "/v2/products/search", "/api/accounts/verify"],
+      "confidence_score": 0.85
+    },
+    "rest_resource_crud": {
+      "label": "REST Resource CRUD",
+      "description": "Pattern CRUD thuần: /prefix/resource",
+      "template": "{prefix}/{resource}",
+      "parts": ["prefix", "resource"],
+      "examples": ["/api/v1/users", "/api/v2/products", "/v1/orders"],
+      "confidence_score": 0.80
+    },
+    "rest_nested_sub_resource": {
+      "label": "REST Nested Sub-Resource",
+      "description": "Pattern tài nguyên lồng nhau: /prefix/resource/{id}/sub-resource",
+      "template": "{prefix}/{resource}/{id_param}/{sub_resource}",
+      "parts": ["prefix", "resource", "id_param", "sub_resource"],
+      "examples": ["/api/v1/users/123/orders", "/api/posts/456/comments", "/v1/groups/789/members"],
+      "confidence_score": 0.88
+    },
+    "rpc_action_based": {
+      "label": "RPC / Action-Based",
+      "description": "Pattern RPC-style hành động trực tiếp: /prefix/action-resource",
+      "template": "{prefix}/{action}-{resource}",
+      "parts": ["prefix", "action", "resource"],
+      "examples": ["/v1/get-users", "/v1/add-group", "/api/delete-product"],
+      "confidence_score": 0.78
+    },
+    "rpc_service_action_resource": {
+      "label": "RPC Microservice + Action-Resource",
+      "description": "RPC với service prefix: /prefix/service/action-resource",
+      "template": "{prefix}/{service}/{action}-{resource}",
+      "parts": ["prefix", "service", "action", "resource"],
+      "examples": ["/v1/group-service/get-members", "/v1/user-service/add-friend"],
+      "confidence_score": 0.82
+    },
+    "admin_panel": {
+      "label": "Admin Panel Routes",
+      "description": "Pattern quản trị: /admin/resource/action",
+      "template": "/admin/{resource}/{action}",
+      "parts": ["resource", "action"],
+      "fixed_prefix": "/admin",
+      "examples": ["/admin/users/list", "/admin/analytics/export", "/admin/logs/download"],
+      "confidence_score": 0.88
+    },
+    "admin_versioned": {
+      "label": "Admin Versioned",
+      "description": "Pattern quản trị có version: /prefix/admin/resource",
+      "template": "{prefix}/admin/{resource}",
+      "parts": ["prefix", "resource"],
+      "fixed_segment": "admin",
+      "examples": ["/v1/admin/users", "/api/v2/admin/reports", "/v1/admin/permissions"],
+      "confidence_score": 0.85
+    },
+    "auth_endpoints": {
+      "label": "Auth/Identity Endpoints",
+      "description": "Pattern xác thực và định danh: /prefix/auth_segment/action",
+      "template": "{prefix}/{auth_segment}/{action}",
+      "parts": ["prefix", "auth_segment", "action"],
+      "examples": ["/v1/auth/login", "/api/auth/logout", "/v1/auth/refresh-token", "/api/accounts/verify"],
+      "confidence_score": 0.92
+    },
+    "internal_debug": {
+      "label": "Internal / Debug Endpoints",
+      "description": "Các endpoint nội bộ, debug, health-check thường bị bỏ quên",
+      "template": "{prefix}/{internal_segment}/{action}",
+      "parts": ["prefix", "internal_segment", "action"],
+      "examples": ["/internal/health", "/actuator/info", "/v1/debug/config", "/_internal/metrics"],
+      "confidence_score": 0.70
+    },
+    "api_gateway_proxy": {
+      "label": "API Gateway Proxy",
+      "description": "Pattern khi có API Gateway: /gateway/service/resource/action",
+      "template": "/gateway/{service}/{resource}/{action}",
+      "parts": ["service", "resource", "action"],
+      "fixed_prefix": "/gateway",
+      "examples": ["/gateway/user-service/users/profile", "/gateway/payment/orders/list"],
+      "confidence_score": 0.65
+    },
+    "export_import": {
+      "label": "Export / Import / Batch",
+      "description": "Pattern thường gặp cho export/import dữ liệu",
+      "template": "{prefix}/{resource}/{batch_action}",
+      "parts": ["prefix", "resource", "batch_action"],
+      "examples": ["/v1/users/export", "/api/reports/download", "/v1/products/import"],
+      "confidence_score": 0.75
+    },
+    "webhook_callback": {
+      "label": "Webhook / Callback",
+      "description": "Endpoints webhook và callback thường ẩn",
+      "template": "{prefix}/webhook/{service}/{event}",
+      "parts": ["prefix", "service", "event"],
+      "examples": ["/v1/webhook/payment/success", "/api/callback/auth/google"],
+      "confidence_score": 0.68
+    }
+  },
+  "part_vocabularies": {
+    "prefixes": {
+      "versioned": ["/v1", "/v2", "/v3"],
+      "api_versioned": ["/api/v1", "/api/v2", "/api/v3"],
+      "api_flat": ["/api"],
+      "bare": [""]
+    },
+    "services": {
+      "generic": [
+        "user-service", "users", "account-service",
+        "auth-service", "identity-service",
+        "payment-service", "billing-service",
+        "order-service", "inventory-service",
+        "group-service", "community-service",
+        "notification-service", "messaging-service",
+        "media-service", "upload-service",
+        "search-service", "analytics-service",
+        "admin-service", "config-service"
+      ]
+    },
+    "resources": {
+      "user_domain": ["users", "accounts", "profiles", "members", "customers"],
+      "content_domain": ["posts", "articles", "comments", "feeds", "pages", "media"],
+      "commerce_domain": ["orders", "products", "cart", "payments", "invoices", "coupons"],
+      "social_domain": ["groups", "friends", "followers", "chats", "messages", "notifications"],
+      "admin_domain": ["roles", "permissions", "settings", "logs", "reports", "analytics", "config"],
+      "auth_domain": ["tokens", "sessions", "keys", "credentials"]
+    },
+    "actions": {
+      "read": ["get", "list", "detail", "search", "view", "fetch", "query"],
+      "write": ["create", "add", "update", "edit", "modify", "patch"],
+      "delete": ["delete", "remove", "cancel", "archive", "deactivate"],
+      "auth": ["login", "logout", "verify", "refresh", "register", "reset-password", "change-password", "verify-email", "verify-otp"],
+      "social": ["follow", "unfollow", "like", "unlike", "share", "report", "block", "unblock", "leave", "join", "invite"],
+      "data_ops": ["export", "import", "download", "upload", "sync", "bulk-delete", "batch-update"],
+      "system": ["status", "health", "ping", "info", "debug", "metrics"]
+    },
+    "sub_resources": {
+      "generic": ["members", "comments", "roles", "permissions", "settings", "history", "logs", "attachments", "tags", "categories"]
+    },
+    "auth_segments": {
+      "common": ["auth", "authentication", "identity", "accounts", "oauth", "sso"]
+    },
+    "internal_segments": {
+      "common": ["internal", "actuator", "management", "debug", "system", "_internal", "health", "ops"]
+    },
+    "batch_actions": {
+      "common": ["export", "import", "download", "upload", "bulk-create", "bulk-update", "bulk-delete", "batch"]
+    },
+    "id_params": {
+      "common": ["{id}", "{uuid}", "1", "123", "me", "current"]
+    },
+    "events": {
+      "common": ["success", "failure", "completed", "cancelled", "paid", "created", "updated"]
+    }
+  },
+  "profile_hints": {
+    "description": "Mapping từ dev_profile.crud_pattern sang danh sách pattern_ids ưu tiên",
+    "action-based": ["rpc_action_based", "rpc_service_action_resource", "rest_versioned_resource"],
+    "RESTful": ["rest_microservice_nested", "rest_nested_sub_resource", "rest_resource_crud", "rest_microservice_id_action"],
+    "microservice": ["rest_microservice_nested", "rest_microservice_id_action", "rpc_service_action_resource", "api_gateway_proxy"],
+    "flat": ["rest_versioned_resource", "rest_resource_crud"],
+    "default": ["rest_microservice_nested", "rest_versioned_resource", "admin_panel", "auth_endpoints", "internal_debug", "export_import"]
+  }
+}
