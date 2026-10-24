@@ -22,6 +22,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional, Set
 
+from src.coordinator.llm_logging import invoke_logged, sanitize_for_log
+
 try:
     from langchain_core.messages import SystemMessage, HumanMessage
     _LANGCHAIN_AVAILABLE = True
@@ -131,16 +133,17 @@ OUTPUT: Chỉ trả về JSON array thuần túy (KHÔNG markdown, KHÔNG giải
 ["/path/to/file1", "/path/to/file2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia Penetration Testing & Web Security. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="SensitiveFilesAssembler", operation="generate_component",
+                context={"component": "config_secrets"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip().startswith("/")]
         except Exception as ex:
-            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh config_secrets: {ex}")
+            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh config_secrets: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -173,16 +176,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["/path/to/backup1.zip", "/path/to/backup2.sql", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia Penetration Testing & Web Security. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="SensitiveFilesAssembler", operation="generate_component",
+                context={"component": "backup_archives"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip().startswith("/")]
         except Exception as ex:
-            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh backup_archives: {ex}")
+            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh backup_archives: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -214,16 +218,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["/admin_path1", "/admin_path2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia Penetration Testing & Web Security. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="SensitiveFilesAssembler", operation="generate_component",
+                context={"component": "admin_panels"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip().startswith("/")]
         except Exception as ex:
-            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh admin_panels: {ex}")
+            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh admin_panels: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -255,16 +260,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["/debug_path1", "/debug_path2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia Penetration Testing & Web Security. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="SensitiveFilesAssembler", operation="generate_component",
+                context={"component": "debug_telemetry"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip().startswith("/")]
         except Exception as ex:
-            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh debug_telemetry: {ex}")
+            logger.warning(f"[SensitiveFilesAssembler][LLM] Lỗi sinh debug_telemetry: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────

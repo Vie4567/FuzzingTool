@@ -66,11 +66,11 @@ def _get_decision_engine(config: dict = None) -> DecisionEngine:
         config = config or {}
         model_name = config.get("llm_model") or os.getenv("LLM_MODEL", "DeepSeek-V4.1-Flash")
         temperature = config.get("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.1")))
-        
+
         # Đọc API Key và Base URL (hỗ trợ cả DeepSeek và OpenAI)
         api_key = config.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
         base_url = config.get("base_url") or os.getenv("DEEPSEEK_BASE_URL") or os.getenv("OPENAI_API_BASE")
-        
+
         # Nếu chưa truyền base_url và dùng DeepSeek, đặt mặc định URL API của DeepSeek
         if not base_url and (os.getenv("DEEPSEEK_API_KEY") or "deepseek" in model_name.lower()):
             base_url = "https://api.deepseek.com"
@@ -153,6 +153,8 @@ def init_state(state: dict) -> dict:
     state.setdefault("fuzzing_stats", {})
     state.setdefault("param_results", [])
     state.setdefault("verified_results", [])
+    state.setdefault("unverified_results", [])
+    state.setdefault("verification_status", "not_checked")
     state.setdefault("false_positives", [])
     state.setdefault("baseline_signature", None)
 
@@ -205,6 +207,8 @@ def run_tech_recon(state: dict) -> dict:
         state["js_endpoints"] = result.get("js_endpoints", [])
         state["waf_detected"] = result.get("waf_detected", False)
         state["waf_type"] = result.get("waf_type", None)
+        # Recon has no complete request telemetry; do not report an invented zero.
+        state["total_http_requests"] = None
         state.setdefault("subagent_justifications", {})["tech_recon"] = result.get("subagent_justification", "")
         state["agent_statuses"]["tech_recon"] = "success"
         circuit_breakers["tech_recon"].record_success()
@@ -353,15 +357,23 @@ def llm_decide_after_wordlist(state: dict) -> dict:
 
 
 def run_fuzzing(state: dict) -> dict:
-    """Node: Agent 3 — Fuzzing & WAF Evasion."""
+    """Node: Agent 3 — Real HTTP fuzzing, preserving partial measurements."""
     state["agent_statuses"]["fuzzing"] = "running"
-    config_adj = state.get("_config_adjustments", {})
+    config_adj = dict(state.get("_config_adjustments") or {})
+    # Manager plans may tune measurement settings, but only operator config can
+    # select a transport, provide routing credentials or define approved scope.
+    from src.tools.proxy_profiles import OPERATOR_PROXY_OPTIONS
+    for key in OPERATOR_PROXY_OPTIONS:
+        config_adj.pop(key, None)
+    config_adj.update(state.get("config", {}).get("fuzzing_options") or {})
+    for key in ("target_url", "wordlist", "waf_detected", "waf_type", "dev_profile", "observed_urls"):
+        config_adj.pop(key, None)
 
     state["audit_log"].append({
         "type": "agent_started",
         "agent": "fuzzing",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "config_adjustments": config_adj,
+        "config_adjustments": FuzzingAgent._public_options(config_adj),
     })
 
     try:
@@ -372,23 +384,34 @@ def run_fuzzing(state: dict) -> dict:
             wordlist=state["wordlist"],
             waf_detected=state.get("waf_detected", False),
             waf_type=state.get("waf_type"),
+            dev_profile=state.get("dev_profile"),
+            observed_urls=list(dict.fromkeys(state.get("discovered_paths", []) + state.get("js_endpoints", []))),
             **config_adj,
         )
 
         state["raw_results"] = result.get("results", [])
         state["fuzzing_stats"] = result.get("stats", {})
         state.setdefault("subagent_justifications", {})["fuzzing"] = result.get("subagent_justification", "")
-        state["total_http_requests"] += result.get(
-            "stats", {}
-        ).get("total_requests", 0)
-        state["agent_statuses"]["fuzzing"] = "success"
+        request_count = result.get("stats", {}).get("total_requests")
+        previous_count = state.get("total_http_requests")
+        state["total_http_requests"] = (
+            previous_count + request_count
+            if isinstance(previous_count, int) and isinstance(request_count, int)
+            else None
+        )
+        state["fuzzing_execution"] = {
+            key: result.get(key) for key in
+            ("engine", "success", "partial", "simulated", "stop_reason", "errors", "warnings", "error_message")
+        }
+        state["agent_statuses"]["fuzzing"] = "success" if result.get("success", True) else "partial" if state["raw_results"] else "failed"
 
         # Tarpit detection
         avg_time = result.get("stats", {}).get(
-            "avg_response_time", 0
+            "avg_response_time"
         )
-        tarpit_detector.record_response_time(avg_time)
-        if tarpit_detector.is_tarpit_detected():
+        if isinstance(avg_time, (int, float)):
+            tarpit_detector.record_response_time(avg_time)
+        if isinstance(avg_time, (int, float)) and tarpit_detector.is_tarpit_detected():
             state["circuit_breaker_state"]["fuzzing"] = "open"
             state["audit_log"].append({
                 "type": "tarpit_detected",
@@ -396,14 +419,17 @@ def run_fuzzing(state: dict) -> dict:
             })
             logger.warning("[Fuzzing] Tarpit detected!")
 
-        circuit_breakers["fuzzing"].record_success()
+        if state["agent_statuses"]["fuzzing"] == "success":
+            circuit_breakers["fuzzing"].record_success()
+        else:
+            circuit_breakers["fuzzing"].record_failure()
 
         http_200_count = len([
             r for r in state["raw_results"]
             if r.get("status_code") == 200
         ])
         logger.info(
-            f"[Fuzzing] Success — "
+            f"[Fuzzing] {state['agent_statuses']['fuzzing']} — "
             f"{len(state['raw_results'])} results, "
             f"{http_200_count} HTTP 200"
         )
@@ -433,6 +459,19 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
     Bao gồm Agent Skip logic — LLM quyết định có nên chạy
     param_disc hay skip trực tiếp sang filter_404.
     """
+    execution = state.get("fuzzing_execution", {})
+    if execution.get("partial") or execution.get("stop_reason") not in (None, "", "completed"):
+        # Preserve measured responses without repeating a blocked/limited scan.
+        state["_last_decision_action"] = "skip_to_filter"
+        state["_config_adjustments"] = {}
+        state["agent_statuses"]["param_disc"] = "skipped"
+        state["audit_log"].append({
+            "type": "fuzzing_stopped",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reason": execution.get("stop_reason") or execution.get("error_message"),
+            "action": "preserve_partial_results",
+        })
+        return state
     engine = _get_decision_engine(state.get("config"))
 
     http_200s = [
@@ -537,11 +576,8 @@ def run_soft404_filter(state: dict) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
+    all_results = (state.get("raw_results") or []) + (state.get("param_results") or [])
     try:
-        all_results = (
-            state.get("raw_results", [])
-            + state.get("param_results", [])
-        )
         agent = Soft404FilterAgent()
         result = agent.execute(
             target_url=state["target_url"],
@@ -549,21 +585,29 @@ def run_soft404_filter(state: dict) -> dict:
         )
 
         state["verified_results"] = result.get("verified", [])
+        state["unverified_results"] = result.get("unverified", [])
+        state["verification_status"] = result.get("verification_status", "completed")
         state["false_positives"] = result.get("false_positives", [])
         state["baseline_signature"] = result.get("baseline")
-        state["agent_statuses"]["soft404_filter"] = "success"
-        circuit_breakers["soft404"].record_success()
+        state["agent_statuses"]["soft404_filter"] = (
+            "skipped" if result.get("verification_performed") is False else "success"
+        )
+        if state["agent_statuses"]["soft404_filter"] == "success":
+            circuit_breakers["soft404"].record_success()
 
         logger.info(
-            f"[Soft404] Success — "
+            f"[Soft404] {state['agent_statuses']['soft404_filter']} — "
             f"{len(state['verified_results'])} verified, "
+            f"{len(state['unverified_results'])} unverified, "
             f"{len(state['false_positives'])} filtered"
         )
 
     except Exception as e:
         state["agent_statuses"]["soft404_filter"] = "failed"
-        # Fallback: giữ raw results nếu filter lỗi
-        state["verified_results"] = state.get("raw_results", [])
+        # Keep real measurements, without pretending they passed verification.
+        state["verified_results"] = []
+        state["unverified_results"] = all_results
+        state["verification_status"] = "failed"
         state["error_log"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent": "soft404_filter",
@@ -589,6 +633,8 @@ def generate_report(state: dict) -> dict:
         "timestamp": state["finished_at"],
         "summary": {
             "verified": len(state.get("verified_results", [])),
+            "unverified": len(state.get("unverified_results", [])),
+            "verification_status": state.get("verification_status", "not_checked"),
             "filtered": len(state.get("false_positives", [])),
             "decisions_made": len(state.get("decision_chain", [])),
         },
@@ -807,6 +853,8 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
         "fuzzing_stats": {},
         "param_results": [],
         "verified_results": [],
+        "unverified_results": [],
+        "verification_status": "not_checked",
         "false_positives": [],
         "baseline_signature": None,
         "llm_call_count": 0,
@@ -839,6 +887,8 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
         duration_sec=max(duration, 0.0),
         stats={
             "verified_results": len(final_state.get("verified_results", [])),
+            "unverified_results": len(final_state.get("unverified_results", [])),
+            "verification_status": final_state.get("verification_status", "not_checked"),
             "false_positives": len(final_state.get("false_positives", [])),
             "llm_calls": final_state.get("llm_call_count", 0),
             "http_requests": final_state.get("total_http_requests", 0),
@@ -847,4 +897,14 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
         }
     )
 
-    return final_state
+    # Keep private routing configuration available throughout execution, then
+    # return public copies without modifying the caller's original config.
+    public_state = dict(final_state)
+    if isinstance(final_state.get("config"), dict):
+        public_config = dict(final_state["config"])
+        if isinstance(public_config.get("fuzzing_options"), dict):
+            public_config["fuzzing_options"] = FuzzingAgent._public_options(public_config["fuzzing_options"])
+        public_state["config"] = public_config
+    if isinstance(final_state.get("_config_adjustments"), dict):
+        public_state["_config_adjustments"] = FuzzingAgent._public_options(final_state["_config_adjustments"])
+    return public_state

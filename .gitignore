@@ -12,7 +12,10 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 
 # Output & Logs
 output_samples/
+logs/
+knowledge_store/
 *.log

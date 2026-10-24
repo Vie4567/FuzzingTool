@@ -21,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from .state import SharedState
 from .knowledge_store import KnowledgeStore
-from .logger import agent_logger, COLOR_MAGENTA, COLOR_CYAN, COLOR_RESET
+from .llm_logging import invoke_logged, sanitize_for_log
 from .prompts import (
     COORDINATOR_SYSTEM_PROMPT,
     DECISION_PROMPT_TEMPLATE,
@@ -229,23 +229,10 @@ class DecisionEngine:
                 execution_time, knowledge_context, available_actions,
             )
 
-        # Log Prompt sent to LLM
-        formatted_messages = prompt.format_messages(**template_vars)
-        prompt_text = "\n\n".join([f"[{m.type.upper()}]\n{m.content}" for m in formatted_messages])
-        agent_logger.info(
-            f"\n{COLOR_MAGENTA}==================== [LLM PROMPT - {decision_id} ({decision_point})] ===================={COLOR_RESET}\n"
-            f"{prompt_text}\n"
-            f"{COLOR_MAGENTA}================================================================================{COLOR_RESET}"
-        )
-
         chain = prompt | self.llm
-        raw_response = chain.invoke(template_vars)
-
-        # Log Response from LLM
-        agent_logger.info(
-            f"\n{COLOR_CYAN}==================== [LLM RESPONSE - {decision_id} ({decision_point})] ===================={COLOR_RESET}\n"
-            f"{raw_response.content}\n"
-            f"{COLOR_CYAN}================================================================================={COLOR_RESET}"
+        raw_response = invoke_logged(
+            chain, template_vars, component="Coordinator", operation="decision",
+            context={"decision_point": decision_point, "decision_id": decision_id},
         )
 
         # ── BƯỚC 4: Parse & Validate ──
@@ -378,23 +365,10 @@ class DecisionEngine:
             ),
         }
 
-        # Log Prompt sent to LLM
-        formatted_messages = self.reflection_prompt.format_messages(**reflection_vars)
-        prompt_text = "\n\n".join([f"[{m.type.upper()}]\n{m.content}" for m in formatted_messages])
-        agent_logger.info(
-            f"\n{COLOR_MAGENTA}==================== [LLM PROMPT - Post Session Reflection] ===================={COLOR_RESET}\n"
-            f"{prompt_text}\n"
-            f"{COLOR_MAGENTA}================================================================================{COLOR_RESET}"
-        )
-
         chain = self.reflection_prompt | self.llm
-        response = chain.invoke(reflection_vars)
-
-        # Log Response from LLM
-        agent_logger.info(
-            f"\n{COLOR_CYAN}==================== [LLM RESPONSE - Post Session Reflection] ===================={COLOR_RESET}\n"
-            f"{response.content}\n"
-            f"{COLOR_CYAN}================================================================================={COLOR_RESET}"
+        response = invoke_logged(
+            chain, reflection_vars, component="Coordinator", operation="reflection",
+            context={"session_id": state.get("session_id", "")},
         )
 
         reflection = self._parse_llm_decision(response.content)
@@ -625,7 +599,7 @@ class DecisionEngine:
         try:
             return json.loads(json_match.group())
         except json.JSONDecodeError as e:
-            logger.error(f"[Decision] JSON parse error: {e}")
+            logger.error(f"[Decision] JSON parse error: {sanitize_for_log(str(e))}")
             return {
                 "action": "abort_to_report",
                 "confidence": 0.3,

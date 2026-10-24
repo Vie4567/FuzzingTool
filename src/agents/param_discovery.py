@@ -1,5 +1,5 @@
 """
-Parameter Discovery Agent — Dò tìm tham số ẩn (hidden params).
+Parameter Discovery Agent — Sinh tham số ứng viên, chưa kiểm chứng bằng HTTP.
 
 Tìm parameter ẩn trên các endpoint HTTP 200 tự chủ:
 - Sử dụng ParameterAssembler với LLM component-by-component enrichment để sinh tập tham số theo ngữ cảnh
@@ -113,7 +113,7 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
 
         log_agent_progress(
             "ParamDiscoveryAgent",
-            f"Đang phân tích {len(endpoints)} HTTP 200 endpoints và sinh parameter wordlist bằng ParameterAssembler..."
+            f"Đang phân tích {len(endpoints)} endpoints để sinh tham số ứng viên; chưa gửi request kiểm chứng..."
         )
 
         assembler_res = self.assembler.assemble(
@@ -140,11 +140,17 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
                 "url": full_url,
                 "path": path,
                 "discovered_params": matched_params,
-                "status_code": 200,
-                "content_length_change": 120 + len(matched_params) * 25,
+                "status_code": None,
+                "content_length_change": None,
+                "result_kind": "parameter_candidates",
+                "verification": "not_checked",
+                "verification_performed": False,
             })
 
         return {
+            "result_kind": "parameter_candidates",
+            "verification": "not_checked",
+            "verification_performed": False,
             "param_results": param_results,
             "assembled_parameter_count": len(param_wordlist),
             "assembled_parameter_sample": param_wordlist[:20],
@@ -166,7 +172,7 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
             task_directive = directive or {
                 "task_id": "TASK_PARAM_001",
                 "target_url": target_url,
-                "objective": f"Dò tìm các tham số HTTP GET/POST ẩn trên {len(endpoints)} đường dẫn HTTP 200.",
+                "objective": f"Sinh tên tham số ứng viên cho {len(endpoints)} đường dẫn; chưa thực hiện kiểm chứng HTTP.",
                 "constraints": {"max_endpoints": 5}
             }
 
@@ -186,40 +192,35 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
                 execution_history=execution_history
             )
 
-            param_meta = res.get("assembler_metadata", {})
             tool_log_entry = {
                 "selected_tool": plan.get("selected_tool", "param_discovery_tool"),
                 "options": plan.get("options", {"target_url": target_url}),
                 "tool_selection_reason": plan.get(
                     "tool_selection_reason",
-                    f"Sử dụng param_discovery_tool kết hợp ParameterAssembler component-by-component trên {len(endpoints)} HTTP 200 endpoints."
+                    f"Dự kiến dùng param_discovery_tool cho {len(endpoints)} endpoints; hiện chỉ chạy ParameterAssembler sinh ứng viên."
                 ),
                 "options_selection_reason": plan.get(
                     "options_selection_reason",
-                    "Phân tích biến đổi Content-Length và response body dựa trên bộ tham số đa tầng (ID, Business, Action, Debug)."
+                    "Gợi ý tên tham số theo ngữ cảnh; chưa đo Content-Length hoặc so sánh HTTP response."
                 ),
                 "result_summary": (
-                    f"Đã phát hiện tham số ẩn cho {len(res['param_results'])} endpoints "
-                    f"(ParameterAssembler đã tạo {res.get('assembled_parameter_count', 0)} tham số ứng viên)."
+                    f"Đã gợi ý tham số ứng viên cho {len(res['param_results'])} endpoints "
+                    f"(ParameterAssembler tạo {res.get('assembled_parameter_count', 0)} tên). Chưa kiểm chứng HTTP."
                 )
             }
-            execution_history.append(tool_log_entry)
 
             agent_logger.info(
-                f"\n{COLOR_MAGENTA}🛠️ [SUB-AGENT TOOL DECISION - ParamDiscoveryAgent]{COLOR_RESET}\n"
-                f"   ├─ Selected Tool: {tool_log_entry['selected_tool']}\n"
+                f"\n{COLOR_MAGENTA}[SUB-AGENT TOOL PLAN - ParamDiscoveryAgent; chưa thực thi]{COLOR_RESET}\n"
+                f"   ├─ Planned Tool: {tool_log_entry['selected_tool']}\n"
                 f"   ├─ Tool Reason: {tool_log_entry['tool_selection_reason']}\n"
                 f"   └─ Options Reason: {tool_log_entry['options_selection_reason']}"
             )
 
-            justification = self.generate_justification(
-                task_directive=task_directive,
-                execution_history=execution_history,
-                extracted_data={
-                    "discovered_endpoints_count": len(res['param_results']),
-                    "assembled_parameter_count": res.get("assembled_parameter_count", 0),
-                    "llm_enriched": param_meta.get("llm_enriched", False),
-                }
+            justification = (
+                f"[ParamDiscoveryAgent] Đã sinh tham số ứng viên cho {len(res['param_results'])} endpoints "
+                f"từ {res.get('assembled_parameter_count', 0)} tên do ParameterAssembler lắp ráp. "
+                "Chưa gửi HTTP request kiểm chứng tham số và chưa thực thi công cụ dò tham số. "
+                "status_code và content_length_change là null vì chưa đo; mọi ứng viên đều chưa xác minh."
             )
 
             agent_logger.info(
@@ -227,13 +228,14 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
                 f"{justification}\n"
             )
 
-            res["tools_executed"] = execution_history
+            res["planned_tool"] = tool_log_entry
+            res["tools_executed"] = []
             res["subagent_justification"] = justification
 
             log_agent_success(
                 "ParamDiscoveryAgent",
-                f"Đã phát hiện tham số ẩn cho {len(res['param_results'])} endpoints "
-                f"({res.get('assembled_parameter_count', 0)} tham số được lắp ráp).",
+                f"Đã sinh tham số ứng viên cho {len(res['param_results'])} endpoints "
+                f"({res.get('assembled_parameter_count', 0)} tên được lắp ráp); chưa kiểm chứng HTTP.",
                 metrics={
                     "analyzed_endpoints": len(res['param_results']),
                     "assembled_parameters": res.get("assembled_parameter_count", 0),

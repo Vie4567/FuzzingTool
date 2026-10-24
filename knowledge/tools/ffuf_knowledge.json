@@ -1,7 +1,7 @@
 {
   "tool_name": "ffuf",
   "category": "fuzzing",
-  "description": "Công cụ Fuzzing & Dò quét Endpoint/Subdomain/Parameter cực nhanh bằng ngôn ngữ Go.",
+  "description": "Công cụ Fuzzing & Dò quét Endpoint/Subdomain/Parameter mạnh mẽ bằng Go.",
   "fuzz_keyword_injection_points": {
     "url_path": {
       "pattern": "https://target.com/FUZZ",
@@ -36,17 +36,22 @@
     "-u": "URL mục tiêu chứa từ khóa FUZZ",
     "-w": "Đường dẫn file Wordlist",
     "-o": "File lưu kết quả xuất ra",
-    "-of": "Định dạng file xuất (json, csv, html, all)",
-    "-t": "Số luồng song song (threads, mặc định: 40)",
+    "-of": "Định dạng file xuất (json, ejson, csv, ecsv, html, md, all); dùng json để đọc số liệu có cấu trúc",
+    "-t": "Số luồng song song (mặc định của ffuf: 40; mặc định thận trọng của ứng dụng: 1)",
     "-p": "Độ trễ giữa các request tính bằng giây (delay)",
     "-rate": "Số request tối đa trên mỗi giây (rate limit)",
     "-r": "Tự động chuyển hướng (Follow Redirects)",
     "-s": "Chế độ im lặng (Silent mode)",
-    "-ac": "Tự động hiệu chỉnh lọc response ngẫu nhiên (Auto-calibration)",
+    "-ac": "Gửi thêm request hiệu chỉnh đến đường dẫn ngẫu nhiên để xây dựng bộ lọc từ response thật (Auto-calibration)",
     "-acc": "Tự động hiệu chỉnh với chuỗi kiểm thử tùy chỉnh",
     "-e": "Danh sách đuôi mở rộng file cần quét (ví dụ: .php,.html,.bak,.zip)",
     "-recursion": "Bật tính năng quét đệ quy các thư mục tìm được",
-    "-recursion-depth": "Độ sâu tối đa khi quét đệ quy"
+    "-recursion-depth": "Độ sâu tối đa khi quét đệ quy",
+    "-timeout": "Timeout HTTP tính bằng giây (mặc định ffuf: 10)",
+    "-maxtime": "Giới hạn thời gian chạy toàn bộ process tính bằng giây; kết quả khi dừng là kết quả một phần",
+    "-sa": "Dừng theo ngưỡng lỗi của ffuf; không thay thế việc wrapper dừng ngay khi gặp 429",
+    "-sf": "Dừng khi hơn 95% response là 403 sau hơn 50 input; không phải ngưỡng 403 liên tiếp",
+    "-x": "Một proxy HTTP/SOCKS5 cố định cho phiên; không dùng pool hoặc đổi IP để tiếp tục sau khi bị chặn"
   },
   "filtering_and_matching_rules": {
     "match_options": {
@@ -67,23 +72,173 @@
     }
   },
   "agent_decision_heuristics": {
-    "waf_evasion_strategy": {
-      "condition": "WAF_DETECTED == True",
+    "rate_limit_and_block_handling": {
+      "condition": "WAF_DETECTED == True or HTTP 429 or repeated HTTP 403",
       "recommended_options": {
-        "-t": 5,
-        "-rate": 10,
-        "-p": 0.5,
-        "-H": "X-Forwarded-For: 127.0.0.1"
+        "-t": 1,
+        "-rate": 2,
+        "-p": 0.5
       },
-      "rationale": "Giảm threads và rate-limit xuống thấp kèm delay ngẫu nhiên để tránh vi phạm ngưỡng Rate-Limiting của WAF."
+      "rationale": "Giới hạn tải gửi đến máy chủ trên toàn bộ tuyến gửi. 403 không chứng minh endpoint hợp lệ và không phải cơ hội thử bypass. Chế độ proxy_http chỉ luân phiên proxy được người vận hành cấu hình trước trong phạm vi origin cho phép; không đổi tuyến để tiếp tục sau khi bị chặn.",
+      "on_429": "Dừng gửi request mới, lưu kết quả một phần và Retry-After nếu có; chỉ chạy lại sau thời gian đó và khi điều kiện cho phép. Không tự retry bằng IP hoặc proxy khác.",
+      "on_consecutive_403": "Dừng sau ngưỡng 403 liên tiếp đã cấu hình, báo blocked cùng số response đã quan sát; không che 403 bằng filter để bỏ qua điều kiện dừng.",
+      "cli_limitation": "-sa/-sf chỉ đánh giá ngưỡng sau hơn 50 input; wrapper cần theo dõi response trực tiếp để áp dụng chính sách dừng sớm. JSON chuẩn của ffuf không chứa Retry-After."
     },
     "soft_404_handling": {
       "condition": "Suspect Soft 404 or Wildcard Response",
       "recommended_options": {
-        "-ac": true,
-        "-fc": "404"
+        "-ac": true
       },
-      "rationale": "Sử dụng Auto-Calibration (-ac) để ffuf tự đo đạc phản hồi giả 404 và loại bỏ tự động."
+      "rationale": "Chỉ tính similarity hoặc gán soft404 sau khi có response baseline thật của đường dẫn không tồn tại, cùng host và ngữ cảnh xác thực. Nếu thiếu baseline hoặc body, đánh dấu chưa xác minh; không sinh điểm random. Lưu số liệu raw trước khi lọc."
+    },
+    "cms_extension_strategy": {
+      "Joomla": [
+        "-e",
+        ".php,.xml,.ini,.bak,.old"
+      ],
+      "WordPress": [
+        "-e",
+        ".php,.json,.txt,.bak"
+      ],
+      "Laravel/ASP.NET": [
+        "-e",
+        ".env,.json,.config,.aspx,.bak"
+      ]
     }
+  },
+  "safe_execution_defaults": {
+    "threads": 1,
+    "rate_limit": 2,
+    "delay_ms": 500,
+    "match_codes": "all",
+    "filter_codes": null,
+    "auto_calibrate": false,
+    "recursion": false,
+    "rationale": "Thu thập mọi status thực tế trước khi phân loại. Chỉ tăng ngân sách request hoặc bật calibration/recursion khi phạm vi và bằng chứng mục tiêu cho phép.",
+    "timeout_seconds": 10,
+    "max_scan_seconds": 120,
+    "max_requests": 100
+  },
+  "wrapper_option_aliases": {
+    "threads": {
+      "flag": "-t",
+      "unit": "concurrent workers"
+    },
+    "rate_limit": {
+      "flag": "-rate",
+      "unit": "requests per second"
+    },
+    "delay_ms": {
+      "flag": "-p",
+      "conversion": "milliseconds / 1000 = seconds"
+    },
+    "match_codes": {
+      "flag": "-mc",
+      "recommended": "all"
+    },
+    "proxy": {
+      "flag": "-x",
+      "policy": "Tùy chọn proxy của ffuf_cli/python_http là một proxy cố định. Danh sách tuyến chỉ được dùng trong engine proxy_http do caller chọn rõ ràng; mọi engine đều dừng sau khi bị chặn."
+    },
+    "timeout_seconds": {
+      "flag": "-timeout",
+      "unit": "seconds"
+    },
+    "max_scan_seconds": {
+      "flag": "-maxtime",
+      "unit": "seconds"
+    },
+    "max_requests": {
+      "flag": null,
+      "policy": "Giới hạn input cho ffuf, không phải cam kết tổng HTTP exchanges; extensions/recursion/calibration có thể tăng request"
+    }
+  },
+  "result_integrity": {
+    "measurements": "status_code, content_length và response_time chỉ lấy từ response hoặc output của công cụ thật. Giá trị không quan sát được phải là null kèm nguyên nhân, không phải số random hay số 0 thay thế.",
+    "ffuf_json_fields": {
+      "status": "HTTP status thực tế",
+      "length": "Số byte body ffuf ghi nhận; thường sau giải nén. Khi bỏ tải body hoặc Content-Length quá lớn, có thể lấy từ header; không mặc định coi là số byte trên dây.",
+      "duration": "Số nanosecond của Go time.Duration; đổi sang giây bằng / 1000000000. Đây là TTFB sau khi ghi xong request, không phải thời gian tải toàn bộ response.",
+      "results": "Các response được matcher/filter giữ lại; số phần tử không phải tổng request đã gửi"
+    },
+    "accounting": "Phân biệt input dự kiến, input đã xử lý, request thực sự thử gửi, response đã nhận, response matched và lỗi. ffuf JSON chuẩn không có tổng request/lỗi; thiếu telemetry thì dùng null. Counter tiến độ của ffuf là input đã xử lý, có thể có retry, calibration, redirect hoặc replay bổ sung; không gán bằng độ dài wordlist.",
+    "failure_policy": "Thiếu binary ffuf có thể dùng backend HTTP native có request thật và ghi rõ backend. Không tạo dữ liệu mô phỏng khi tool thiếu, lỗi khởi chạy, timeout hoặc JSON hỏng. Giữ kết quả một phần kèm trạng thái và lý do dừng.",
+    "verification": "HTTP 200/403 hoặc một match không chứng minh endpoint tồn tại. Chỉ gán verified sau bước kiểm chứng thực tế đã mô tả, dùng baseline thật; chưa kiểm chứng thì giữ nhãn unverified."
+  },
+  "sources": [
+    "https://github.com/ffuf/ffuf#usage",
+    "https://github.com/ffuf/ffuf/blob/v2.1.0/pkg/output/file_json.go",
+    "https://github.com/ffuf/ffuf/blob/v2.1.0/pkg/runner/simple.go",
+    "https://github.com/ffuf/ffuf/blob/v2.1.0/pkg/ffuf/job.go",
+    "https://pkg.go.dev/time#Duration",
+    "https://www.rfc-editor.org/rfc/rfc6585.html#section-4"
+  ],
+  "local_lab_mode": {
+    "engine": "loopback_lab",
+    "purpose": "Minh họa xoay địa chỉ IP nguồn loopback cho bài thực hành trên cùng máy; không xoay IP công cộng.",
+    "target_scope": "Chỉ 127.0.0.1, ::1 hoặc localhost được chuẩn hóa về 127.0.0.1; không kết nối tới hostname/IP bên ngoài.",
+    "lab_source_ips": [
+      "127.0.0.2",
+      "127.0.0.3"
+    ],
+    "safe_execution_defaults": {
+      "max_scan_seconds": 60,
+      "max_requests": 4,
+      "threads": 1,
+      "rate_limit": 2,
+      "timeout_seconds": 10,
+      "follow_redirects": false,
+      "recursion": false
+    },
+    "measurements": "Bind socket thật; selected_source_ip là lựa chọn, bound_source_ip lấy từ socket. Đối chiếu với peer IP trên server. Giữ status/byte length/time đo thực.",
+    "blocking_policy": "Dừng toàn phiên ở 429 hoặc ba 403 liên tiếp, trước khi gửi bằng địa chỉ nguồn tiếp theo.",
+    "external_engines": "ffuf_cli và python_http giữ proxy cố định. Engine proxy_http hỗ trợ proxy thủ công hoặc ProxyScrape do caller chọn rõ ràng, trong các origin được phép; giữ nguyên điều kiện dừng khi bị chặn.",
+    "documentation": "docs/loopback_ip_rotation_lab.md"
+  },
+  "controlled_proxy_mode": {
+    "engine": "proxy_http",
+    "activation": "Chỉ bật khi caller trực tiếp chọn engine=proxy_http và allowed_origins. Chế độ manual yêu cầu proxy_profiles hoặc proxy_profiles_env; chế độ tự động yêu cầu caller chọn proxy_source=proxyscrape. LLM không được cung cấp hay ghi đè các tùy chọn nguồn proxy, pool và phạm vi.",
+    "purpose": "Kiểm thử qua pool proxy thủ công hoặc ProxyScrape đã được kiểm tra, trong phạm vi và ngân sách do người vận hành cung cấp.",
+    "target_scope": "allowed_origins là danh sách origin HTTP(S) chính xác, không có đường dẫn hay wildcard; mọi URL sau khi thay FUZZ phải vẫn thuộc danh sách. Không tự theo redirect hoặc quét đệ quy.",
+    "configuration": {
+      "proxy_profiles": "Danh sách profile có id và url; URL endpoint proxy chỉ hỗ trợ http://, có thể có username/password.",
+      "proxy_profiles_env": "Tên biến môi trường chứa JSON danh sách profile, dùng thay proxy_profiles để giữ bí mật ngoài lời gọi agent.",
+      "allowed_origins": "Danh sách origin được phép do caller cung cấp trực tiếp, ví dụ https://cab.vn nếu nằm trong phạm vi đã được phép.",
+      "proxy_source": "manual (mặc định) hoặc proxyscrape; chế độ tự động dùng API HTTPS cố định, không nhận kèm profile thủ công.",
+      "proxy_count": "Số proxy hoạt động tối đa, 1..8; tự động mặc định 2, thủ công mặc định toàn bộ profile.",
+      "proxy_candidate_limit": "Tối đa 1..100 ứng viên mỗi lần tải, mặc định 20; chuẩn hóa và loại trùng trước khi kiểm tra.",
+      "proxy_fetch_timeout_seconds": "Timeout tải danh sách, 0.01..30 giây; mặc định 10.",
+      "proxy_check_timeout_seconds": "Timeout mỗi lần kiểm tra proxy, 0.01..30 giây; mặc định 5.",
+      "proxy_refresh_seconds": "Chu kỳ tải lại giữa các request, mặc định 300 giây; 0 tắt cập nhật, hoặc 30..86400 giây.",
+      "proxy_healthcheck_url": "URL GET trong allowed_origins; tự động mặc định origin/robots.txt. Thủ công chỉ kiểm tra trước khi quét nếu khai báo URL này. Không gửi token, cookie hay body fuzzing trong request kiểm tra."
+    },
+    "transport": "Round-Robin qua các proxy hoạt động; HTTPS dùng CONNECT và xác thực TLS. ProxyScrape chỉ lấy ứng viên HTTP có IP công cộng, lọc trùng và kiểm tra trước khi đưa vào pool. Không dùng SOCKS, Tor, header IP giả hay dịch vụ đo IP ngoài phạm vi. Không chuyển trực tiếp khi proxy lỗi.",
+    "health_checks": "Chấp nhận response 2xx đã đọc hết body và không lỗi transport. Lỗi kiểm tra bị ghi nhận và loại ứng viên trong suốt phiên; kiểm tra và fuzzing dùng chung rate, max_requests và thời hạn. 403/429/407 khi kiểm tra dừng phiên ngay. Kết quả kiểm tra nằm trong health_checks, tách khỏi results fuzzing.",
+    "safe_execution_defaults": {
+      "threads": 1,
+      "rate_limit": 2,
+      "delay_ms": 500,
+      "timeout_seconds": 10,
+      "max_scan_seconds": 120,
+      "max_requests": 100,
+      "follow_redirects": false,
+      "recursion": false,
+      "stop_on_block": true,
+      "stop_on_429": true,
+      "consecutive_403_limit": 3
+    },
+    "enforced_limits": {
+      "threads": 1,
+      "max_rate_limit": 10,
+      "max_requests": 1000,
+      "max_scan_seconds": 600,
+      "max_timeout_seconds": 30,
+      "time_budget": "Kiểm tra quanh thao tác socket; không phải cơ chế hủy cứng và thao tác đang chờ có thể vượt ngân sách."
+    },
+    "blocking_policy": "Fuzzing dừng ở 429 đầu tiên hoặc ba 403 liên tiếp. Sau 403 đầu tiên, giữ cùng proxy cho đến khi hết chuỗi 403 hoặc dừng; không đổi proxy hay refresh để vượt chặn. HTTP 407 hoặc lỗi transport khi fuzzing loại proxy và dừng phiên. Không retry/failover; refresh không khởi động lại phiên đã dừng.",
+    "performance": "stats.proxy_profiles ghi request kiểm tra/fuzzing, response, thời gian trung bình mọi lần thử, lỗi mạng, HTTP >=400 và error_rate theo ID. error_rate là số lần có lỗi mạng hoặc HTTP >=400 chia số lần thử; null nếu chưa gửi. Số lần tải provider ghi riêng, không tính thành request tới target.",
+    "measurements": "proxy_profile_id ghi tuyến đã chọn, không chứng minh IP egress khác nhau. egress_ip phải null khi chưa có bằng chứng từ server log hoặc phép đo độc lập. Không coi hostname proxy là IP công cộng. Status/byte length/time chỉ lấy từ HTTP thật; lỗi giữ null và lý do.",
+    "secret_handling": "Không đưa URL proxy chứa thông tin đăng nhập vào prompt, output, log chia sẻ hoặc báo cáo; ưu tiên biến môi trường được cấp ngoài source. Kết nối tới endpoint proxy HTTP không được mã hóa nên cần mạng được kiểm soát.",
+    "documentation": "docs/proxy_http_authorized_testing.md"
   }
 }

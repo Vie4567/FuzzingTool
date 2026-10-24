@@ -1,7 +1,7 @@
 """
 Fuzzing Agent — Hệ thống con Fuzzing (Planner → Engine → Analyst).
 
-Thực thi Fuzzing đường dẫn với WAF evasion tự chủ:
+Thực thi Fuzzing đường dẫn với số liệu HTTP thực:
 - Nạp tri thức công cụ từ `knowledge/ffuf_knowledge.json`.
 - Tích hợp EndpointAssembler: nhận dev_profile → chọn patterns → generate phần → lắp ráp endpoints.
 - Tự suy luận chọn tool, chọn options (flags) & giải trình kết quả.
@@ -9,7 +9,7 @@ Thực thi Fuzzing đường dẫn với WAF evasion tự chủ:
 
 import json
 import logging
-import random
+from collections import Counter
 from pathlib import Path
 from typing import Optional, List
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class FuzzingAgent(BaseAutonomousAgent):
-    """Fuzzing Agent — Thực thi Fuzzing & WAF Evasion tự chủ dựa trên Tri thức Công cụ."""
+    """Fuzzing Agent — Giữ nguyên số liệu đo và báo rõ kết quả một phần/lỗi."""
 
     def __init__(self, llm=None):
         super().__init__(agent_name="FuzzingAgent", llm=llm, tool_registry=default_registry)
@@ -40,7 +40,7 @@ class FuzzingAgent(BaseAutonomousAgent):
         self.assembler = EndpointAssembler()
 
     def _load_knowledge(self, fname: str) -> dict:
-        p = Path("knowledge") / fname
+        p = Path(__file__).resolve().parents[2] / "knowledge" / fname
         if p.exists():
             try:
                 with open(p, "r", encoding="utf-8") as f:
@@ -115,7 +115,7 @@ class FuzzingAgent(BaseAutonomousAgent):
         return result
 
     # ══════════════════════════════════════════════════════════════════════
-    # PHASE 1: FUZZING ENGINE (Simulation / Real tool)
+    # PHASE 1: REAL HTTP ENGINE (compatibility entry point)
     # ══════════════════════════════════════════════════════════════════════
 
     def _run_fuzzing_internal(
@@ -126,46 +126,55 @@ class FuzzingAgent(BaseAutonomousAgent):
         waf_type: str = None,
         **config_adjustments,
     ) -> dict:
-        results = []
-        status_weights = {200: 0.15, 301: 0.05, 403: 0.10, 404: 0.65, 500: 0.05}
+        from src.tools.http_fuzzing import run_http_fuzzing
+        return run_http_fuzzing(target_url, wordlist, **config_adjustments)
 
-        for path in wordlist:
-            roll = random.random()
-            cumulative = 0.0
-            status = 404
+    @staticmethod
+    def _public_options(options: dict) -> dict:
+        """Keep credentials and large wordlists out of logs and LLM explanations."""
+        public = dict(options)
+        if "wordlist" in public:
+            public["wordlist_count"] = len(public.pop("wordlist"))
+        if isinstance(public.get("headers"), dict):
+            public["headers"] = {key: "<redacted>" for key in public["headers"]}
+        for key in ("proxy", "proxy_profiles", "proxy_profiles_env", "proxy_pool", "proxies", "proxy_list",
+                    "post_data", "body", "cookie", "token", "api_key", "password"):
+            if public.get(key):
+                public[key] = "<redacted>"
+        return public
 
-            for code, weight in status_weights.items():
-                cumulative += weight
-                if roll <= cumulative:
-                    status = code
-                    break
+    @staticmethod
+    def _normalize_options(options: dict) -> dict:
+        normalized = dict(options)
+        for alias, canonical in {
+            "delay_between_requests_ms": "delay_ms",
+            "match_status_codes": "match_codes",
+            "max_entries_to_use": "max_requests",
+            "maxtime": "max_scan_seconds",
+            "max_duration_seconds": "max_scan_seconds",
+            "timeout": "timeout_seconds",
+            "method": "http_method",
+            "body": "post_data",
+        }.items():
+            if alias in normalized:
+                normalized.setdefault(canonical, normalized.pop(alias))
+        return normalized
 
-            results.append({
-                "url": f"{target_url.rstrip('/')}{path if path.startswith('/') else '/' + path}",
-                "path": path,
-                "status_code": status,
-                "content_length": random.randint(100, 50000),
-                "response_time": round(random.uniform(0.05, 2.0), 3),
-                "redirect_url": f"{target_url}/login" if status == 301 else None,
-            })
-
-        total_requests = len(wordlist)
-        avg_time = sum(r["response_time"] for r in results) / max(len(results), 1)
-
-        stats = {
-            "total_requests": total_requests,
-            "status_codes": {
-                str(code): sum(1 for r in results if r["status_code"] == code)
-                for code in {200, 301, 403, 404, 500}
-            },
-            "avg_response_time": round(avg_time, 3),
-            "waf_blocks_detected": 0,
-        }
-
-        return {
-            "results": results,
-            "stats": stats,
-        }
+    @staticmethod
+    def _observed_stats(tool_data: dict, results: list) -> dict:
+        """Derive missing response statistics without inventing request totals."""
+        stats = dict(tool_data.get("stats") or {})
+        responses = [row for row in results if row.get("status_code") is not None]
+        times = [row["response_time"] for row in responses
+                 if isinstance(row.get("response_time"), (int, float))]
+        stats.setdefault("total_requests", tool_data.get("total_requests"))
+        stats.setdefault("planned_requests", tool_data.get("planned_requests"))
+        stats.setdefault("returned_results", len(results))
+        stats.setdefault("matched_responses", len(responses))
+        stats.setdefault("status_codes", dict(Counter(str(row["status_code"]) for row in responses)))
+        stats.setdefault("avg_response_time", sum(times) / len(times) if times else None)
+        stats.setdefault("measurement_scope", "returned_responses")
+        return stats
 
     # ══════════════════════════════════════════════════════════════════════
     # EXECUTE — Entry point chính
@@ -206,7 +215,7 @@ class FuzzingAgent(BaseAutonomousAgent):
             "waf_detected": waf_detected,
             "waf_type": waf_type,
             "use_pattern_engine": use_pattern_engine,
-            "config_adjustments": config_adjustments,
+            "config_adjustments": self._public_options(config_adjustments),
         })
 
         try:
@@ -242,7 +251,7 @@ class FuzzingAgent(BaseAutonomousAgent):
                 "target_context": {
                     "waf_detected": waf_detected,
                     "waf_type": waf_type,
-                    "config_adjustments": config_adjustments,
+                    "config_adjustments": self._public_options(config_adjustments),
                     "pattern_engine_used": use_pattern_engine,
                     "pattern_assembly_metadata": pattern_assembly_result.get("metadata", {}),
                 },
@@ -260,43 +269,73 @@ class FuzzingAgent(BaseAutonomousAgent):
             )
 
             selected_tool = plan.get("selected_tool", "ffuf_fuzzing_tool")
-            options = plan.get("options", {})
+            if selected_tool != "ffuf_fuzzing_tool":
+                raise ValueError(f"Unsupported fuzzing tool: {selected_tool}")
+            planned_options = plan.get("options") or {}
+            if not isinstance(planned_options, dict):
+                raise ValueError("Fuzzing tool options must be an object")
+            defaults = self.ffuf_knowledge.get("safe_execution_defaults", {})
+            options = {key: value for key, value in defaults.items() if key != "rationale"}
+            planned_options = self._normalize_options(planned_options)
+            caller_options = self._normalize_options(config_adjustments)
+            requested_engine = caller_options.get("engine", planned_options.get("engine", "auto"))
+            if requested_engine == "proxy_http":
+                if caller_options.get("engine") != "proxy_http":
+                    raise ValueError("proxy_http must be explicitly selected by the caller")
+                # The LLM cannot invent routing credentials or expand approved scope.
+                from src.tools.proxy_profiles import OPERATOR_PROXY_OPTIONS
+                for key in OPERATOR_PROXY_OPTIONS:
+                    planned_options.pop(key, None)
+                proxy_defaults = self.ffuf_knowledge.get("controlled_proxy_mode", {}).get(
+                    "safe_execution_defaults", {"max_scan_seconds": 120, "max_requests": 100}
+                )
+                options.update(proxy_defaults)
+            if requested_engine == "loopback_lab":
+                lab_defaults = self.ffuf_knowledge.get("local_lab_mode", {}).get(
+                    "safe_execution_defaults", {"max_scan_seconds": 60, "max_requests": 4}
+                )
+                options.update(lab_defaults)
+            options.update(planned_options)
+            # Explicit caller/coordinator configuration takes precedence over the LLM.
+            options.update(caller_options)
             options["target_url"] = target_url
             options["wordlist"] = merged_wordlist
             options["waf_detected"] = waf_detected
 
             # ── Phase 2: Gọi Tool ────────────────────────────────────────
             tool_execution_res = self.tool_registry.execute_tool(selected_tool, options)
-            tool_data = tool_execution_res.get("result", {}).get("result_data", {})
-
-            if not tool_data or "stats" not in tool_data:
-                fallback_res = self._run_fuzzing_internal(
-                    target_url, merged_wordlist, waf_detected, waf_type, **config_adjustments
-                )
-                results_list = fallback_res["results"]
-                stats_dict = fallback_res["stats"]
-            else:
-                results_list = tool_data.get("results", [])
-                stats_dict = tool_data.get("stats", {
-                    "total_requests": len(merged_wordlist),
-                    "status_codes": {"200": len(results_list), "404": 0},
-                    "avg_response_time": 0.1
-                })
+            tool_result = tool_execution_res.get("result")
+            if not isinstance(tool_result, dict):
+                raise RuntimeError(tool_execution_res.get("error") or "Fuzzing tool returned no result")
+            tool_data = tool_result.get("result_data")
+            if not isinstance(tool_data, dict) or "results" not in tool_data:
+                raise RuntimeError(tool_result.get("error_message") or "Fuzzing tool returned no measurements")
+            if tool_data.get("simulated"):
+                raise RuntimeError("Simulated fuzzing data is not accepted as HTTP measurements")
+            results_list = tool_data["results"]
+            if not isinstance(results_list, list):
+                raise ValueError("Fuzzing measurements must be a list")
+            stats_dict = self._observed_stats(tool_data, results_list)
+            success = bool(tool_execution_res.get("success") and tool_result.get("success", True))
+            partial = bool(tool_data.get("partial") or tool_data.get("stopped_early") or not success)
+            public_options = self._public_options(options)
+            request_total = stats_dict.get("total_requests")
+            request_label = str(request_total) if request_total is not None else "chưa xác định"
 
             tool_log_entry = {
                 "selected_tool": selected_tool,
-                "options": options,
+                "options": public_options,
                 "tool_selection_reason": plan.get(
                     "tool_selection_reason",
-                    "Dựa trên tri thức ffuf_knowledge.json, chọn ffuf_fuzzing_tool để quét đường dẫn với cờ né tránh WAF."
+                    "Chọn ffuf_fuzzing_tool để đo phản hồi HTTP thực và giới hạn tải gửi tới máy chủ."
                 ),
                 "options_selection_reason": plan.get(
                     "options_selection_reason",
-                    f"Cấu hình rate_limit={options.get('rate_limit', 50)} và delay_ms={options.get('delay_ms', 0)} để an toàn trước WAF."
+                    f"Cấu hình rate_limit={options.get('rate_limit', 2)} và delay_ms={options.get('delay_ms', 0)}."
                 ),
                 "result_summary": (
-                    f"Đã quét {stats_dict.get('total_requests', len(merged_wordlist))} requests. "
-                    f"Tìm được {stats_dict.get('status_codes', {}).get('200', 0)} HTTP 200."
+                    f"Số request thực: {request_label}; thu được {len(results_list)} bản ghi. "
+                    f"Trạng thái: {'complete' if success else 'partial/failed'}. HTTP 200 không đồng nghĩa endpoint đã xác minh."
                 ),
                 "pattern_engine": pattern_assembly_result.get("metadata", {}),
             }
@@ -306,7 +345,7 @@ class FuzzingAgent(BaseAutonomousAgent):
                 f"\n{COLOR_MAGENTA}🛠️ [SUB-AGENT TOOL DECISION - FuzzingAgent]{COLOR_RESET}\n"
                 f"   ├─ Selected Tool    : {tool_log_entry['selected_tool']}\n"
                 f"   ├─ Merged Wordlist  : {len(merged_wordlist)} entries\n"
-                f"   ├─ Synthesized Opts : {json.dumps({k: v for k, v in options.items() if k != 'wordlist'}, ensure_ascii=False)}\n"
+                f"   ├─ Synthesized Opts : {json.dumps(public_options, ensure_ascii=False)}\n"
                 f"   ├─ Tool Reason      : {tool_log_entry['tool_selection_reason']}\n"
                 f"   └─ Options Reason   : {tool_log_entry['options_selection_reason']}"
             )
@@ -317,11 +356,17 @@ class FuzzingAgent(BaseAutonomousAgent):
                 execution_history=execution_history,
                 extracted_data={
                     "http_200_count": stats_dict.get("status_codes", {}).get("200", 0),
-                    "total_requests": stats_dict.get("total_requests", len(merged_wordlist)),
+                    "total_requests": request_total,
+                    "engine": tool_data.get("engine"),
+                    "partial": partial,
+                    "stop_reason": tool_data.get("stop_reason"),
                     "pattern_endpoints_added": len(
                         pattern_assembly_result.get("endpoints", [])
                     ),
                 }
+            ) if success else (
+                f"Fuzzing dừng với kết quả một phần/lỗi: {tool_data.get('stop_reason') or tool_result.get('error_message')}. "
+                f"Giữ nguyên {len(results_list)} bản ghi đo được; không tạo dữ liệu thay thế hoặc xác minh giả."
             )
 
             agent_logger.info(
@@ -330,21 +375,36 @@ class FuzzingAgent(BaseAutonomousAgent):
             )
 
             res = {
+                "success": success,
+                "partial": partial,
+                "simulated": False,
+                "engine": tool_data.get("engine"),
                 "results": results_list,
                 "stats": stats_dict,
+                "errors": tool_data.get("errors", []),
+                "warnings": tool_data.get("warnings", []),
+                "stop_reason": tool_data.get("stop_reason"),
+                "error_message": tool_result.get("error_message"),
                 "tools_executed": execution_history,
                 "subagent_justification": justification,
                 "pattern_assembly": pattern_assembly_result,
                 "merged_wordlist_size": len(merged_wordlist),
             }
+            for field in ("health_checks", "proxy_pool", "proxy_refresh_events", "settings"):
+                if field in tool_data:
+                    res[field] = tool_data[field]
 
+            if not success:
+                logger.warning("Fuzzing stopped with partial/failed measurements: %s",
+                               tool_result.get("error_message") or tool_data.get("stop_reason"))
+                return res
             log_agent_success(
                 "FuzzingAgent",
-                f"Hoàn thành fuzzing {stats_dict.get('total_requests', len(merged_wordlist))} requests.",
+                f"Hoàn thành fuzzing; số request: {request_label}, {len(results_list)} bản ghi phản hồi.",
                 metrics={
                     "http_200": stats_dict.get("status_codes", {}).get("200", 0),
                     "http_403": stats_dict.get("status_codes", {}).get("403", 0),
-                    "avg_response_time_sec": stats_dict.get("avg_response_time", 0),
+                    "avg_response_time_sec": stats_dict.get("avg_response_time"),
                     "pattern_endpoints": len(pattern_assembly_result.get("endpoints", [])),
                 }
             )

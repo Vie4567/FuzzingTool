@@ -49,12 +49,15 @@ class SharedState(TypedDict, total=False):
 
     # Agent 5: Soft 404 Filter
     verified_results: list              # Kết quả đã verify (loại soft 404)
+    unverified_results: list            # Phản hồi thật chưa có phép kiểm chứng endpoint
+    verification_status: str            # not_checked | not_implemented | completed | failed
     false_positives: list               # Các kết quả bị loại
     baseline_signature: Optional[dict]  # Baseline DOM signature cho comparison
 
     # ── GUARD RAILS ──────────────────────────────────────────
     llm_call_count: int                 # Tổng LLM calls (agents + coordinator)
-    total_http_requests: int            # Tổng HTTP requests
+    total_http_requests: Optional[int]  # None nếu chưa có telemetry đầy đủ, không đoán từ wordlist
+    fuzzing_execution: dict             # engine/success/partial/stop_reason và lỗi thực thi
     error_log: list                     # Danh sách lỗi
     circuit_breaker_state: dict         # {agent_name: "closed"|"open"|"half_open"}
     iteration_count: int                # Đếm iteration (chống loop vô hạn)

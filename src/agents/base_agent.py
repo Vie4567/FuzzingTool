@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from src.coordinator.logger import agent_logger, COLOR_CYAN, COLOR_MAGENTA, COLOR_RESET
+from src.coordinator.llm_logging import invoke_logged, sanitize_for_log
 from src.tools.registry import ToolRegistry, default_registry
 
 logger = logging.getLogger(__name__)
@@ -81,11 +81,11 @@ class BaseAutonomousAgent:
 
         chain = prompt | self.llm
         try:
-            res = chain.invoke({
+            res = invoke_logged(chain, {
                 "tools_json": json.dumps(available_tools, ensure_ascii=False, indent=2),
                 "directive_json": json.dumps(task_directive, ensure_ascii=False, indent=2),
                 "history_json": json.dumps(execution_history, ensure_ascii=False, indent=2),
-            })
+            }, component=self.agent_name, operation="plan_tool_execution")
             content = res.content.strip()
             # Clean json fences if present
             if content.startswith("```json"):
@@ -94,7 +94,7 @@ class BaseAutonomousAgent:
                 content = content[:-3]
             return json.loads(content.strip())
         except Exception as exc:
-            logger.warning(f"Lỗi khi LLM suy luận plan_tool_execution: {exc}. Dùng fallback.")
+            logger.warning(f"Lỗi khi LLM suy luận plan_tool_execution: {sanitize_for_log(str(exc))}. Dùng fallback.")
             if available_tools and len(execution_history) < len(available_tools):
                 t = available_tools[len(execution_history)]
                 return {
@@ -133,11 +133,11 @@ class BaseAutonomousAgent:
 
         chain = prompt | self.llm
         try:
-            res = chain.invoke({
+            res = invoke_logged(chain, {
                 "directive_json": json.dumps(task_directive, ensure_ascii=False, indent=2),
                 "history_json": json.dumps(execution_history, ensure_ascii=False, indent=2),
                 "data_json": json.dumps(extracted_data, ensure_ascii=False, indent=2),
-            })
+            }, component=self.agent_name, operation="generate_justification")
             return res.content.strip()
         except Exception as exc:
             return f"[{self.agent_name}] Đã hoàn thành thu thập dữ liệu mục tiêu với {len(execution_history)} tool invocations."

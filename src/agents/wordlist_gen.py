@@ -41,6 +41,7 @@ from src.coordinator.logger import (
     COLOR_MAGENTA,
     COLOR_RESET,
 )
+from src.coordinator.llm_logging import invoke_logged, response_log_path, sanitize_for_log
 from src.agents.base_agent import BaseAutonomousAgent
 from src.agents.endpoint_assembler import EndpointAssembler
 from src.agents.sensitive_assembler import SensitiveFilesAssembler
@@ -76,7 +77,7 @@ class WordlistGenAgent(BaseAutonomousAgent):
                         temperature=temperature,
                     )
                 except Exception as ex:
-                    logger.warning(f"[WordlistGenAgent] Khong the khoi tao LLM: {ex}")
+                    logger.warning(f"[WordlistGenAgent] Khong the khoi tao LLM: {sanitize_for_log(str(ex))}")
 
         super().__init__(agent_name="WordlistGenAgent", llm=llm, tool_registry=default_registry)
 
@@ -91,7 +92,7 @@ class WordlistGenAgent(BaseAutonomousAgent):
         js_endpoints: list = None,
     ) -> dict:
         """Su dung LLM phan tich 8 chieu thoi quen cua developer."""
-        combined_paths = list(set((discovered_paths or []) + (js_endpoints or [])))
+        combined_paths = list(dict.fromkeys((discovered_paths or []) + (js_endpoints or [])))
         sample_paths = combined_paths[:60]
 
         fallback_profile = self._build_heuristic_dev_profile(tech_stack, combined_paths)
@@ -144,10 +145,11 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
 
         try:
             log_agent_progress("WordlistGenAgent", "Dang goi LLM phan tich 8 chieu thoi quen Developer Profile...")
-            response = self.llm.invoke([
+            response = invoke_logged(self.llm, [
                 SystemMessage(content=prompt_system),
                 HumanMessage(content=prompt_user),
-            ])
+            ], component="WordlistGenAgent", operation="analyze_dev_profile",
+                context={"observed_path_count": len(combined_paths)})
             content = response.content.strip()
 
             m = re.search(r'\{.*\}', content, re.DOTALL)
@@ -170,7 +172,7 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
                 }
                 return dev_profile
         except Exception as ex:
-            logger.warning(f"[WordlistGenAgent] LLM Profiling gap loi, su dung fallback: {ex}")
+            logger.warning(f"[WordlistGenAgent] LLM Profiling gap loi, su dung fallback: {sanitize_for_log(str(ex))}")
 
         return fallback_profile
 
@@ -361,7 +363,7 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
         """Sinh Wordlist da tang toi uu hoa theo Target Profile."""
         backend = tech_stack.get("backend", tech_stack.get("backend_language", "unknown"))
         cms = tech_stack.get("cms", "unknown")
-        all_recon_paths = list(set((discovered_paths or []) + (js_endpoints or [])))
+        all_recon_paths = list(dict.fromkeys((discovered_paths or []) + (js_endpoints or [])))
 
         log_agent_start("WordlistGenAgent", f"Target Profile (Backend: {backend}, Paths: {len(all_recon_paths)})")
 
@@ -405,6 +407,28 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
             )
             parameter_wordlist = parameter_result.get("parameters", [])
             parameter_meta = parameter_result.get("metadata", {})
+
+            # Preserve how component candidates become paths separately from the
+            # final merged wordlist. These are suggestions, not HTTP findings.
+            trace_file = output_dir / "02_pattern_trace.json"
+            generation_strategy = "component_by_component_then_template_assembly"
+            trace = {
+                "generation_strategy": generation_strategy,
+                "verification": "candidate_generation_only",
+                "llm_response_log_file": str(Path(response_log_path()).resolve()),
+                "endpoint_assembly": assembler_meta,
+                "sensitive_file_groups": sensitive_result.get("components", {}),
+                "parameter_groups": parameter_result.get("components", {}),
+                "notes": [
+                    "LLM proposes vocabulary per selected semantic slot; templates assemble endpoints.",
+                    "Prefix and ID values use observed/profile/knowledge inputs rather than invented LLM IDs.",
+                    "Sensitive file and parameter assemblers generate separate candidate groups.",
+                    "Legacy llm_predicted_* fields count assembled endpoints, including knowledge-based candidates.",
+                ],
+            }
+            with trace_file.open("w", encoding="utf-8") as stream:
+                json.dump(sanitize_for_log(trace), stream, indent=2, ensure_ascii=False)
+            log_agent_progress("WordlistGenAgent", f"Pattern trace saved: {trace_file}")
 
             # Luu parameter wordlist ra file rieng
             param_file = output_dir / "02_parameter_wordlist.txt"
@@ -467,6 +491,8 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
                 "assembler_endpoints_count": len(assembler_endpoints),
                 "assembler_sample": assembler_endpoints[:15],
                 "assembler_metadata": assembler_meta,
+                "generation_strategy": generation_strategy,
+                "pattern_trace_file": str(trace_file),
                 "sensitive_files_count": len(sensitive_paths),
                 "sensitive_sample": sensitive_paths[:15],
                 "sensitive_metadata": sensitive_meta,
@@ -474,6 +500,9 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
                 "llm_predicted_sample": assembler_endpoints[:15],
                 "metadata": {
                     "total_entries": len(final_wordlist),
+                    "generation_strategy": generation_strategy,
+                    "endpoint_candidate_sources": ["observed_paths", "llm_components", "knowledge"],
+                    "llm_predicted_paths_is_legacy_alias": True,
                     "recon_paths_included": len(all_recon_paths),
                     "assembler_endpoints": len(assembler_endpoints),
                     "llm_predicted_paths": len(assembler_endpoints),
@@ -485,6 +514,8 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
                     "llm_enriched_params": parameter_meta.get("enriched_counts", {}),
                     "target_profile_file": str(profile_file),
                     "parameter_wordlist_file": str(param_file),
+                    "pattern_trace_file": str(trace_file),
+                    "llm_response_log_file": str(Path(response_log_path()).resolve()),
                 },
             }
             return result

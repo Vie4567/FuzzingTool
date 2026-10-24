@@ -21,6 +21,9 @@ import re
 from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
+from urllib.parse import urlsplit
+
+from src.coordinator.llm_logging import invoke_logged
 
 try:
     from langchain_core.messages import SystemMessage, HumanMessage
@@ -99,7 +102,8 @@ class EndpointAssembler:
     def _is_static_asset(self, token: str) -> bool:
         """Trả về True nếu token trông như file static asset (có extension tĩnh)."""
         lower = token.lower()
-        return any(lower.endswith(ext) for ext in self._STATIC_EXTENSIONS)
+        # Files remain in the original recon wordlist, never in semantic API slots.
+        return "." in lower or any(lower.endswith(ext) for ext in self._STATIC_EXTENSIONS)
 
     def _classify_token(self, token: str, position: int, total_segments: int) -> str:
 
@@ -115,6 +119,8 @@ class EndpointAssembler:
         """
         # Static asset → bỏ qua hoàn toàn
         if self._is_static_asset(token):
+            return "skip"
+        if not self._valid_part_value("resource", token) and not self._ID_PATTERN.match(token):
             return "skip"
 
         # ID động
@@ -181,10 +187,14 @@ class EndpointAssembler:
         pattern_hit_counter: Counter = Counter()
         all_patterns = self._knowledge.get("patterns", {})
 
-        valid_urls = [
-            u for u in (observed_urls or [])
-            if isinstance(u, str) and u.startswith("/")
-        ]
+        valid_urls = []
+        for raw in observed_urls or []:
+            if not isinstance(raw, str):
+                continue
+            parsed = urlsplit(raw)
+            path = parsed.path if parsed.scheme in ("http", "https") else raw
+            if path.startswith("/") and not path.startswith("//"):
+                valid_urls.append(path)
 
         for url in valid_urls:
             # Loại bỏ query string và fragment
@@ -287,7 +297,13 @@ class EndpointAssembler:
         # Heuristic score dựa trên số lượng segment của pattern
         for pid, p in all_patterns.items():
             template_parts = p.get("parts", [])
-            template_len = len(template_parts)
+            template_len = len([part for part in template_parts if part != "prefix"])
+            if "service" in template_parts and not (
+                business_segs and re.search(r"-(service|svc|api|srv)$", business_segs[0], re.IGNORECASE)
+            ):
+                continue
+            if "id_param" in template_parts and not any(self._ID_PATTERN.match(seg) for seg in business_segs):
+                continue
             score = 0
 
             # Chiều dài phù hợp → cộng điểm
@@ -359,10 +375,16 @@ class EndpointAssembler:
                 if pid not in candidate_ids:
                     candidate_ids.append(pid)
 
+        observed_services = (url_analysis or {}).get("extracted_parts", {}).get("service", [])
+        profile_services = dev_profile.get("detected_services") or llm_analysis.get("url_hierarchy", {}).get("detected_services", [])
+        flat_without_services = "flat" in str(url_style).lower() and not (observed_services or profile_services)
         selected = []
         for pid in candidate_ids:
             if pid in all_patterns:
                 p = dict(all_patterns[pid])
+                # A flat frontend route is not evidence of a microservice hierarchy.
+                if flat_without_services and "service" in p.get("parts", []):
+                    continue
                 p["id"] = pid
                 selected.append(p)
 
@@ -378,6 +400,20 @@ class EndpointAssembler:
     # BƯỚC 2a: LLM ENRICHMENT — SINH TỪNG PHẦN THEO CONTEXT
     # ──────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _valid_part_value(part: str, value: Any) -> bool:
+        if not isinstance(value, str) or value != value.strip():
+            return False
+        if part == "prefix":
+            return value == "" or bool(re.fullmatch(r"(?:/[A-Za-z0-9_-]+)+", value))
+        if part == "id_param":
+            return bool(re.fullmatch(
+                r"(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\d+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})",
+                value,
+            )) or value in ("me", "current")
+        # Slots contain one semantic segment, not whole endpoints, files or URLs.
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,99}", value))
+
     def _generate_parts_with_llm(
         self,
         llm: Any,
@@ -385,199 +421,68 @@ class EndpointAssembler:
         url_analysis: Optional[Dict[str, Any]],
         selected_patterns: List[Dict[str, Any]],
     ) -> Dict[str, List[str]]:
-        """
-        Gọi LLM RIÊNG BIỆT cho từng phần URL (service, resource, action, sub_resource)
-        để bổ sung vocabulary theo business context thay vì sinh endpoint hoàn chỉnh.
-
-        Quy trình:
-          1. Tổng hợp context: business_domain, naming_convention, observed_services,
-             observed_resources, observed_actions, các URL patterns đang dùng.
-          2. Gửi LLM request cho phần SERVICE: "Domain X thường có những service/module nào?"
-          3. Gửi LLM request cho phần RESOURCE: "Với các service trên, resource nào thường tồn tại?"
-          4. Gửi LLM request cho phần ACTION: "Với các resource trên, action nào thường bị bỏ sót?"
-          5. Trả về dict {"service": [...], "resource": [...], "action": [...], ...}
-        """
+        """Request one vocabulary per semantic slot used by selected templates."""
         if not llm or not _LANGCHAIN_AVAILABLE:
             return {}
-
-        llm_analysis = dev_profile.get("llm_analysis", {})
-        business_domain = llm_analysis.get("business_domain", "web application")
-        naming = dev_profile.get("naming_convention",
-                                  llm_analysis.get("naming_convention", "kebab-case"))
-        crud_pattern = llm_analysis.get("crud_pattern", "RESTful")
-        inferred_rules = llm_analysis.get("inferred_rules", [])
-
-        # Lấy những gì đã extract được từ URL thật làm seed context
+        analysis = dev_profile.get("llm_analysis", {})
         extracted = (url_analysis or {}).get("extracted_parts", {})
-        observed_services = extracted.get("service", [])[:15]
-        observed_resources = extracted.get("resource", [])[:20]
-        observed_actions = extracted.get("action", [])[:15]
-        observed_prefixes = extracted.get("prefix", [])[:5]
-
-        # Các pattern đang được sử dụng (để biết phần nào cần sinh)
-        parts_needed: Set[str] = set()
-        for p in selected_patterns:
-            parts_needed.update(p.get("parts", []))
-
-        llm_enriched: Dict[str, List[str]] = {}
-
-        sys_prompt = (
-            "Bạn là chuyên gia Penetration Testing và API Security với kinh nghiệm phân tích "
-            "cấu trúc API của nhiều loại ứng dụng web. Nhiệm vụ của bạn là dự đoán các "
-            "thành phần URL còn ẩn/chưa được phát hiện dựa trên context của target. "
-            "Luôn tuân thủ naming convention và chỉ trả về JSON array thuần túy, không giải thích."
-        )
-
-        # ── BƯỚC 1: Sinh SERVICE candidates theo domain ──────────────────
-        if "service" in parts_needed:
-            logger.info("[EndpointAssembler][LLM] Đang sinh service vocabulary theo context...")
-            prompt_service = f"""TARGET CONTEXT:
-- Business Domain: {business_domain}
-- Naming Convention: {naming} (VD: user-service, payment-service)
-- CRUD/Action Pattern: {crud_pattern}
-- URL Prefix đã phát hiện: {json.dumps(observed_prefixes)}
-- Services đã phát hiện từ URL thật: {json.dumps(observed_services)}
-- Inferred Rules: {json.dumps(inferred_rules)}
-
-YÊU CẦU: Dựa trên business domain "{business_domain}" và các services đã biết, hãy sinh thêm
-các service/module names khác có khả năng tồn tại cao trong hệ thống này.
-Tập trung vào các microservice phổ biến của domain này mà CHƯA có trong danh sách đã biết.
-Bắt buộc tuân thủ naming convention: {naming}.
-Sinh 10-15 services.
-
-OUTPUT: JSON array (KHÔNG markdown, KHÔNG giải thích):
-["service-name-1", "service-name-2", ...]"""
+        needed = {part for pattern in selected_patterns for part in pattern.get("parts", [])}
+        descriptions = {
+            "service": "service/module names, such as user-service or payments",
+            "resource": "resource/entity nouns, such as users or orders",
+            "action": "operation verbs, such as search or verify-email",
+            "sub_resource": "nested resource nouns, such as comments or members",
+            "auth_segment": "identity/authentication route segments, such as auth or accounts",
+            "internal_segment": "internal diagnostics route segments, such as actuator or management",
+            "batch_action": "batch/export operation names, such as export or bulk-update",
+            "event": "webhook event names, such as completed or payment-success",
+        }
+        enriched: Dict[str, List[str]] = {}
+        for part, description in descriptions.items():
+            if part not in needed:
+                continue
+            relevant = [pattern for pattern in selected_patterns if part in pattern.get("parts", [])]
+            pattern_ids = [pattern["id"] for pattern in relevant]
+            context = {
+                "business_domain": analysis.get("business_domain", "web application"),
+                "naming_convention": dev_profile.get("naming_convention", analysis.get("naming_convention", "kebab-case")),
+                "crud_pattern": analysis.get("crud_pattern", "unknown"),
+                "inferred_rules": analysis.get("inferred_rules", []),
+                "observed_parts": extracted,
+                "already_generated_parts": enriched,
+                "selected_patterns": [{"id": pattern["id"], "template": pattern.get("template", "")} for pattern in relevant],
+            }
+            prompt = (
+                "TARGET CONTEXT:\n" + json.dumps(context, ensure_ascii=False) +
+                f"\nGenerate 10-20 additional {description} for ONLY the '{part}' slot. "
+                "Return one JSON array of unique strings. Each string must be a single URL segment. "
+                "Do not return full endpoints, URLs, files, query strings, slashes, IDs or explanations. "
+                "Follow the observed naming convention and business context."
+            )
+            enriched[part] = []
             try:
-                resp = llm.invoke([
-                    SystemMessage(content=sys_prompt),
-                    HumanMessage(content=prompt_service),
-                ])
-                m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
-                if m:
-                    items = json.loads(m.group(0))
-                    llm_enriched["service"] = [
-                        s for s in items
-                        if isinstance(s, str) and s and " " not in s
-                    ]
-                    logger.info(f"[EndpointAssembler][LLM] service: +{len(llm_enriched['service'])} items")
-            except Exception as ex:
-                logger.warning(f"[EndpointAssembler][LLM] Lỗi sinh service: {ex}")
-
-        # ── BƯỚC 2: Sinh RESOURCE candidates theo services ───────────────
-        if "resource" in parts_needed:
-            logger.info("[EndpointAssembler][LLM] Đang sinh resource vocabulary theo context...")
-            all_services = list(dict.fromkeys(
-                observed_services + llm_enriched.get("service", [])
-            ))[:12]
-            prompt_resource = f"""TARGET CONTEXT:
-- Business Domain: {business_domain}
-- Naming Convention: {naming}
-- Services/Modules đã xác định: {json.dumps(all_services)}
-- Resources đã phát hiện từ URL thật: {json.dumps(observed_resources)}
-
-YÊU CẦU: Với các services trên trong context "{business_domain}", hãy sinh thêm các
-resource names (danh từ số nhiều thường gặp trong API) còn thiếu/ẩn.
-Mỗi resource đại diện cho một loại dữ liệu/entity trong hệ thống.
-Tập trung vào resources có khả năng bị misconfigure hoặc expose thông tin nhạy cảm.
-Tuân thủ naming convention: {naming}. Sinh 15-20 resources.
-
-OUTPUT: JSON array:
-["resource-name-1", "resource-name-2", ...]"""
-            try:
-                resp = llm.invoke([
-                    SystemMessage(content=sys_prompt),
-                    HumanMessage(content=prompt_resource),
-                ])
-                m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
-                if m:
-                    items = json.loads(m.group(0))
-                    llm_enriched["resource"] = [
-                        r for r in items
-                        if isinstance(r, str) and r and " " not in r
-                    ]
-                    logger.info(f"[EndpointAssembler][LLM] resource: +{len(llm_enriched['resource'])} items")
-            except Exception as ex:
-                logger.warning(f"[EndpointAssembler][LLM] Lỗi sinh resource: {ex}")
-
-        # ── BƯỚC 3: Sinh ACTION candidates theo resources + pattern ──────
-        if "action" in parts_needed:
-            logger.info("[EndpointAssembler][LLM] Đang sinh action vocabulary theo context...")
-            all_resources = list(dict.fromkeys(
-                observed_resources + llm_enriched.get("resource", [])
-            ))[:12]
-            prompt_action = f"""TARGET CONTEXT:
-- Business Domain: {business_domain}
-- Naming Convention: {naming}
-- CRUD/Action Pattern: {crud_pattern}
-- Resources đã xác định: {json.dumps(all_resources)}
-- Actions đã phát hiện từ URL thật: {json.dumps(observed_actions)}
-- Inferred Rules: {json.dumps(inferred_rules)}
-
-YÊU CẦU: Với các resources trên trong hệ thống "{business_domain}", hãy sinh thêm các
-action names (động từ/verb) có khả năng tồn tại cao mà chưa được phát hiện.
-Đặc biệt chú ý đến:
-- Admin actions thường bị bỏ sót (approve, reject, ban, restore, ...)
-- Data export/import actions (export, download, bulk-delete, ...)
-- Auth-related actions ẩn (verify-otp, reset-password, refresh-token, ...)
-- Business-specific actions của domain "{business_domain}"
-Tuân thủ naming convention: {naming} và CRUD pattern: {crud_pattern}. Sinh 15-20 actions.
-
-OUTPUT: JSON array:
-["action-name-1", "action-name-2", ...]"""
-            try:
-                resp = llm.invoke([
-                    SystemMessage(content=sys_prompt),
-                    HumanMessage(content=prompt_action),
-                ])
-                m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
-                if m:
-                    items = json.loads(m.group(0))
-                    llm_enriched["action"] = [
-                        a for a in items
-                        if isinstance(a, str) and a and " " not in a
-                    ]
-                    logger.info(f"[EndpointAssembler][LLM] action: +{len(llm_enriched['action'])} items")
-            except Exception as ex:
-                logger.warning(f"[EndpointAssembler][LLM] Lỗi sinh action: {ex}")
-
-        # ── BƯỚC 4: Sinh SUB_RESOURCE candidates ────────────────────────
-        if "sub_resource" in parts_needed:
-            logger.info("[EndpointAssembler][LLM] Đang sinh sub_resource vocabulary theo context...")
-            all_resources = list(dict.fromkeys(
-                observed_resources + llm_enriched.get("resource", [])
-            ))[:10]
-            prompt_sub = f"""TARGET CONTEXT:
-- Business Domain: {business_domain}
-- Resources chính: {json.dumps(all_resources)}
-- Naming Convention: {naming}
-
-YÊU CẦU: Với các resource chính trên, hãy sinh các sub-resource names thường xuất hiện
-trong nested URL patterns (VD: /users/{{id}}/orders, /groups/{{id}}/members).
-Sinh 8-12 sub-resources phổ biến trong hệ thống "{business_domain}".
-
-OUTPUT: JSON array:
-["sub-resource-1", "sub-resource-2", ...]"""
-            try:
-                resp = llm.invoke([
-                    SystemMessage(content=sys_prompt),
-                    HumanMessage(content=prompt_sub),
-                ])
-                m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
-                if m:
-                    items = json.loads(m.group(0))
-                    llm_enriched["sub_resource"] = [
-                        s for s in items
-                        if isinstance(s, str) and s and " " not in s
-                    ]
-                    logger.info(f"[EndpointAssembler][LLM] sub_resource: +{len(llm_enriched['sub_resource'])} items")
-            except Exception as ex:
-                logger.warning(f"[EndpointAssembler][LLM] Lỗi sinh sub_resource: {ex}")
-
-        return llm_enriched
-
-    # ──────────────────────────────────────────────────────────────────────
-    # BƯỚC 2b: GENERATE TỪNG PHẦN THEO DEV_PROFILE (merge static + LLM)
-    # ──────────────────────────────────────────────────────────────────────
+                response = invoke_logged(
+                    llm,
+                    [SystemMessage(content="Generate contextual API pattern components. Return only a JSON array."),
+                     HumanMessage(content=prompt)],
+                    component="EndpointAssembler", operation="generate_part",
+                    context={"part": part, "pattern_ids": pattern_ids},
+                )
+                content = response.content
+                if not isinstance(content, str):
+                    raise ValueError("LLM component response must be text")
+                content = content.strip()
+                if content.startswith("```"):
+                    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content).strip()
+                items = json.loads(content)
+                if not isinstance(items, list):
+                    raise ValueError("LLM component response must be an array")
+                enriched[part] = list(dict.fromkeys(
+                    item for item in items if self._valid_part_value(part, item)
+                ))[:40]
+            except Exception as exc:
+                logger.warning("[EndpointAssembler][LLM] Invalid %s response; using observed/profile/knowledge values (%s)", part, type(exc).__name__)
+        return enriched
 
     def _generate_parts(
         self,
@@ -585,161 +490,86 @@ OUTPUT: JSON array:
         url_analysis: Optional[Dict[str, Any]] = None,
         llm_enriched_parts: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, List[str]]:
-        """
-        Tạo danh sách giá trị cho từng phần (part vocabulary) theo thứ tự ưu tiên:
-          1. Target-specific: trích xuất từ URL thật (url_analysis.extracted_parts)
-          2. LLM-enriched: các giá trị do LLM sinh theo context (llm_enriched_parts)
-          3. Profile-based: detected_services, common_actions từ LLM dev_profile
-          4. Generic fallback: vocabulary mặc định trong knowledge base
-        """
+        """Merge validated observed, LLM, profile and knowledge values, retaining sources."""
         vocab = self._knowledge.get("part_vocabularies", {})
-        llm_analysis = dev_profile.get("llm_analysis", {})
-        naming = dev_profile.get("naming_convention",
-                                  llm_analysis.get("naming_convention", "kebab-case"))
-
-        # Lấy parts đã extract từ URL thật (nếu có)
+        analysis = dev_profile.get("llm_analysis", {})
         extracted = (url_analysis or {}).get("extracted_parts", {})
-        # LLM-enriched parts (component-by-component generation)
         llm_parts = llm_enriched_parts or {}
+        naming = dev_profile.get("naming_convention", analysis.get("naming_convention", "kebab-case"))
+        parts: Dict[str, List[str]] = {}
+        sources: Dict[str, Dict[str, List[str]]] = {}
 
-        def _to_string_items(val) -> List[str]:
-            if isinstance(val, str):
-                return [val]
-            elif isinstance(val, (list, set, tuple)):
-                res = []
-                for x in val:
-                    res.extend(_to_string_items(x))
-                return res
-            elif isinstance(val, dict):
-                res = []
-                for k, v in val.items():
-                    if isinstance(v, str):
-                        res.append(v)
-                    elif isinstance(v, (list, set, tuple)):
-                        res.extend(_to_string_items(v))
-                    elif isinstance(k, str):
-                        res.append(k)
-                return res
-            elif val is not None:
-                return [str(val)]
-            return []
+        def add(part, source, values):
+            parts.setdefault(part, [])
+            sources.setdefault(part, {})
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, (list, tuple, set)):
+                return
+            for raw in values:
+                if not self._valid_part_value(part, raw):
+                    continue
+                value = raw if part in ("prefix", "id_param") else self._apply_naming(raw, naming)
+                if not self._valid_part_value(part, value):
+                    continue
+                if value not in parts[part]:
+                    parts[part].append(value)
+                source_list = sources[part].setdefault(value, [])
+                if source not in source_list:
+                    source_list.append(source)
 
-        def _merge_unique(*lists) -> List[str]:
-            """Merge nhiều list, loại trùng, ép kiểu string an toàn, giữ thứ tự."""
-            seen: Set[str] = set()
-            result = []
-            for lst in lists:
-                for raw_item in (lst or []):
-                    for item in _to_string_items(raw_item):
-                        clean_item = str(item).strip()
-                        if clean_item and clean_item not in seen:
-                            seen.add(clean_item)
-                            result.append(clean_item)
-            return result
+        hierarchy = analysis.get("url_hierarchy", {})
+        common_prefix = dev_profile.get("common_prefix", hierarchy.get("common_prefix"))
+        version = dev_profile.get("api_versioning", analysis.get("versioning"))
+        no_version = version is None or str(version).lower() in ("", "none", "unknown", "null", "n/a")
+        explicit_bare = no_version and not common_prefix
+        # Bare routes must survive empty-string handling when versioning is absent.
+        if explicit_bare:
+            add("prefix", "profile", [""])
+        add("prefix", "observed", extracted.get("prefix", []))
+        if isinstance(common_prefix, str):
+            add("prefix", "profile", [common_prefix.rstrip("/")])
+        if not no_version:
+            clean_version = str(version).strip("/")
+            if re.fullmatch(r"v?\d+(?:[._-]\d+)*", clean_version):
+                add("prefix", "profile", ["/" + clean_version, "/api/" + clean_version])
+        if not parts.get("prefix"):
+            add("prefix", "knowledge", [""])
 
-        # ── Prefix ──────────────────────────────────────────────────────
-        common_prefix = dev_profile.get(
-            "common_prefix",
-            llm_analysis.get("url_hierarchy", {}).get("common_prefix", "/v1/")
-        )
-        versioning = dev_profile.get(
-            "api_versioning",
-            llm_analysis.get("versioning", "v1")
-        )
-        clean_prefix = common_prefix.rstrip("/") if common_prefix else f"/{versioning}"
-        profile_prefixes = list({clean_prefix, f"/{versioning}", f"/api/{versioning}", "/api"})
-        prefix_candidates = _merge_unique(
-            extracted.get("prefix", []),   # 1. từ URL thật
-            url_analysis.get("detected_prefixes", []) if url_analysis else [],
-            profile_prefixes,               # 2. từ profile
-        )
-
-        # ── Services ────────────────────────────────────────────────────
-        detected_services = dev_profile.get(
-            "detected_services",
-            llm_analysis.get("url_hierarchy", {}).get("detected_services", [])
-        )
-        generic_services = vocab.get("services", {}).get("generic", [])
-        service_candidates = _merge_unique(
-            extracted.get("service", []),         # 1. từ URL thật
-            llm_parts.get("service", []),          # 2. LLM enriched theo context
-            detected_services,                      # 3. từ profile
-            generic_services[:8],                  # 4. generic fallback
-        )
-
-        # ── Resources ───────────────────────────────────────────────────
-        generic_resources: List[str] = []
-        for domain_resources in vocab.get("resources", {}).values():
-            generic_resources.extend(domain_resources)
-        resource_candidates = _merge_unique(
-            [self._apply_naming(r, naming) for r in extracted.get("resource", [])],          # 1. thật
-            [self._apply_naming(r, naming) for r in llm_parts.get("resource", [])],          # 2. LLM enriched
-            [self._apply_naming(r, naming) for r in generic_resources],                       # 3. generic
-        )
-
-        # ── Actions ─────────────────────────────────────────────────────
-        profile_actions = llm_analysis.get("common_actions", [])
-        generic_actions: List[str] = []
-        for action_list in vocab.get("actions", {}).values():
-            generic_actions.extend(action_list)
-        action_candidates = _merge_unique(
-            [self._apply_naming(a, naming) for a in extracted.get("action", [])],            # 1. thật
-            [self._apply_naming(a, naming) for a in llm_parts.get("action", [])],            # 2. LLM enriched
-            [self._apply_naming(a, naming) for a in profile_actions],                        # 3. profile
-            [self._apply_naming(a, naming) for a in generic_actions],                        # 4. generic
-        )
-
-        # ── Sub-resources ────────────────────────────────────────────────
-        generic_sub = vocab.get("sub_resources", {}).get("generic", [])
-        sub_resource_candidates = _merge_unique(
-            [self._apply_naming(s, naming) for s in extracted.get("sub_resource", [])],     # 1. thật
-            [self._apply_naming(s, naming) for s in llm_parts.get("sub_resource", [])],     # 2. LLM enriched
-            [self._apply_naming(s, naming) for s in generic_sub],                            # 3. generic
-        )
-
-        # ── Auth segments ────────────────────────────────────────────────
-        profile_auth = llm_analysis.get("auth_pattern", None)
-        auth_defaults = vocab.get("auth_segments", {}).get("common", ["auth"])
-        auth_candidates_raw = []
-        if profile_auth:
-            if isinstance(profile_auth, str):
-                words = re.findall(r'[a-zA-Z0-9_\-]+', profile_auth)
-                matched = [w for w in words if any(k in w.lower() for k in ("auth", "account", "token", "login", "oauth"))]
-                auth_candidates_raw.extend(matched if matched else [profile_auth])
-            else:
-                auth_candidates_raw.extend(_to_string_items(profile_auth))
-        auth_segment_candidates = _merge_unique(
-            auth_candidates_raw,
-            auth_defaults,
-        )
-
-        # ── Internal segments ────────────────────────────────────────────
-        internal_segment_candidates = vocab.get("internal_segments", {}).get("common", ["internal"])
-
-        # ── Batch actions ────────────────────────────────────────────────
-        batch_action_candidates = vocab.get("batch_actions", {}).get("common", ["export"])
-
-        # ── ID params ────────────────────────────────────────────────────
-        id_param_candidates = _merge_unique(
-            extracted.get("id_param", []),
-            vocab.get("id_params", {}).get("common", ["{id}", "1"]),
-        )
-
-        # ── Events (webhook) ────────────────────────────────────────────
-        event_candidates = vocab.get("events", {}).get("common", ["success", "completed"])
-
-        return {
-            "prefix": prefix_candidates,
-            "service": service_candidates,
-            "resource": resource_candidates,
-            "action": action_candidates,
-            "sub_resource": sub_resource_candidates,
-            "auth_segment": auth_segment_candidates,
-            "internal_segment": internal_segment_candidates,
-            "batch_action": batch_action_candidates,
-            "id_param": id_param_candidates,
-            "event": event_candidates,
+        definitions = {
+            "service": ("services", "generic"),
+            "resource": ("resources", None),
+            "action": ("actions", None),
+            "sub_resource": ("sub_resources", "generic"),
+            "auth_segment": ("auth_segments", "common"),
+            "internal_segment": ("internal_segments", "common"),
+            "batch_action": ("batch_actions", "common"),
+            "id_param": ("id_params", "common"),
+            "event": ("events", "common"),
         }
+        for part, (category, group) in definitions.items():
+            add(part, "observed", extracted.get(part, []))
+            add(part, "llm", llm_parts.get(part, []))
+            if part == "service":
+                add(part, "profile", dev_profile.get("detected_services") or hierarchy.get("detected_services", []))
+            elif part == "action":
+                add(part, "profile", analysis.get("common_actions", []))
+            elif part == "auth_segment":
+                profile_auth = analysis.get("auth_pattern")
+                if profile_auth and str(profile_auth).lower() not in ("none", "none-detected", "unknown"):
+                    add(part, "profile", profile_auth)
+            category_values = vocab.get(category, {})
+            if isinstance(category_values, dict):
+                if group:
+                    add(part, "knowledge", category_values.get(group, []))
+                else:
+                    for values in category_values.values():
+                        add(part, "knowledge", values)
+        self._part_sources = {
+            part: [{"value": value, "sources": source_map[value]} for value in parts[part]]
+            for part, source_map in sources.items()
+        }
+        return parts
 
     def _apply_naming(self, token: Any, naming: str) -> str:
         """Chuyển đổi token theo naming_convention."""
@@ -763,48 +593,38 @@ OUTPUT: JSON array:
         parts: Dict[str, List[str]],
         max_per_pattern: int = 200,
     ) -> List[str]:
-        """
-        Lắp ráp các tổ hợp endpoint cho một pattern cụ thể.
-        Chia nhỏ từng slot theo `pattern["parts"]` rồi cartesian product.
-        """
-        template: str = pattern.get("template", "")
-        part_keys: List[str] = pattern.get("parts", [])
-
-        # Giới hạn số giá trị mỗi phần để tránh tổ hợp bùng nổ
-        budget_per_part = max(1, int(max_per_pattern ** (1.0 / max(len(part_keys), 1))))
-        budget_per_part = min(budget_per_part, 15)  # hard limit
-
-        slots: List[List[str]] = []
-        for key in part_keys:
-            candidates = parts.get(key, [key])[:budget_per_part]
-            if not candidates:
-                candidates = [key]  # fallback: dùng tên phần làm giá trị
-            slots.append(candidates)
-
-        assembled: List[str] = []
-        for combo in itertools.product(*slots):
-            # Tạo dict mapping key → value cho combo này
-            fill = dict(zip(part_keys, combo))
-
+        """Bounded products with an initial pass covering every slot vocabulary."""
+        template = pattern.get("template", "")
+        keys = pattern.get("parts", [])
+        self._last_pattern_values = {key: [] for key in keys}
+        if max_per_pattern <= 0 or not template:
+            return []
+        slots = [parts.get(key, []) for key in keys]
+        if not keys or any(not values for values in slots):
+            return []
+        # A diagonal pass prevents earlier observed values from excluding every LLM
+        # value in a later vocabulary when the Cartesian product exceeds the budget.
+        coverage = (tuple(values[index % len(values)] for values in slots)
+                    for index in range(max(map(len, slots))))
+        combinations = itertools.chain(coverage, itertools.product(*slots))
+        assembled = []
+        seen = set()
+        for combo in combinations:
             try:
-                endpoint = template.format(**fill)
-                # Chuẩn hoá double-slash
-                while "//" in endpoint:
-                    endpoint = endpoint.replace("//", "/")
-                if not endpoint.startswith("/"):
-                    endpoint = "/" + endpoint
-                assembled.append(endpoint)
-            except KeyError:
-                pass  # bỏ qua nếu template có key không có trong fill
-
+                endpoint = template.format(**dict(zip(keys, combo)))
+            except (KeyError, ValueError):
+                continue
+            endpoint = re.sub(r"/{2,}", "/", "/" + endpoint.lstrip("/"))
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            assembled.append(endpoint)
+            for key, value in zip(keys, combo):
+                if value not in self._last_pattern_values[key]:
+                    self._last_pattern_values[key].append(value)
             if len(assembled) >= max_per_pattern:
                 break
-
         return assembled
-
-    # ──────────────────────────────────────────────────────────────────────
-    # ENTRY POINT CHÍNH
-    # ──────────────────────────────────────────────────────────────────────
 
     def assemble(
         self,
@@ -910,6 +730,7 @@ OUTPUT: JSON array:
         all_endpoints: List[str] = []
         max_per_pattern = max(50, max_endpoints // max(len(patterns), 1))
         patterns_used = []
+        pattern_results = []
 
         for pattern in patterns:
             if len(all_endpoints) >= max_endpoints:
@@ -922,6 +743,11 @@ OUTPUT: JSON array:
             )
             all_endpoints.extend(chunk)
             patterns_used.append(pattern["id"])
+            pattern_results.append({
+                "pattern_id": pattern["id"], "template": pattern.get("template", ""),
+                "parts": pattern.get("parts", []), "count": len(chunk), "sample": chunk[:10],
+                "used_values": self._last_pattern_values,
+            })
             logger.info(
                 f"[EndpointAssembler] Pattern '{pattern['id']}' → {len(chunk)} endpoints"
             )
@@ -935,8 +761,14 @@ OUTPUT: JSON array:
             "parts_counts": {k: len(v) for k, v in parts.items()},
             "url_analysis": url_analysis or {},
             "target_specific": url_analysis is not None and url_analysis.get("url_count", 0) > 0,
-            "llm_enriched": bool(llm_enriched_parts),
+            "llm_enriched": any(llm_enriched_parts.values()),
             "llm_enriched_parts": {k: len(v) for k, v in llm_enriched_parts.items()},
+            "selected_patterns": [{"id": pattern["id"], "template": pattern.get("template", ""),
+                                   "parts": pattern.get("parts", [])} for pattern in patterns],
+            "part_vocabularies": parts,
+            "llm_part_items": llm_enriched_parts,
+            "slot_sources": getattr(self, "_part_sources", {}),
+            "pattern_results": pattern_results,
         }
 
         logger.info(

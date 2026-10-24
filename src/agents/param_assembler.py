@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 
+from src.coordinator.llm_logging import invoke_logged, sanitize_for_log
+
 try:
     from langchain_core.messages import SystemMessage, HumanMessage
     _LANGCHAIN_AVAILABLE = True
@@ -119,16 +121,17 @@ OUTPUT: Chỉ trả về JSON array thuần túy (KHÔNG markdown, KHÔNG giải
 ["param1", "param2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia API Security Testing. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="ParameterAssembler", operation="generate_component",
+                context={"component": "id_lookup"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip() and " " not in p]
         except Exception as ex:
-            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh id_lookup params: {ex}")
+            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh id_lookup params: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -162,16 +165,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["param1", "param2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia API Security Testing. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="ParameterAssembler", operation="generate_component",
+                context={"component": "pagination_sort"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip() and " " not in p]
         except Exception as ex:
-            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh pagination_sort params: {ex}")
+            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh pagination_sort params: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -209,16 +213,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["param1", "param2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia API Security Testing. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="ParameterAssembler", operation="generate_component",
+                context={"component": "business_fields"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip() and " " not in p]
         except Exception as ex:
-            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh business_fields params: {ex}")
+            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh business_fields params: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -251,16 +256,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["param1", "param2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia API Security Testing. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="ParameterAssembler", operation="generate_component",
+                context={"component": "action_control"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip() and " " not in p]
         except Exception as ex:
-            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh action_control params: {ex}")
+            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh action_control params: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────
@@ -293,16 +299,17 @@ OUTPUT: Chỉ trả về JSON array:
 ["param1", "param2", ...]"""
 
         try:
-            resp = llm.invoke([
+            resp = invoke_logged(llm, [
                 SystemMessage(content="Bạn là chuyên gia API Security Testing. Chỉ trả về JSON array thuần túy."),
                 HumanMessage(content=prompt),
-            ])
+            ], component="ParameterAssembler", operation="generate_component",
+                context={"component": "debug_security"})
             m = re.search(r'\[.*?\]', resp.content.strip(), re.DOTALL)
             if m:
                 items = json.loads(m.group(0))
                 return [p.strip() for p in items if isinstance(p, str) and p.strip() and " " not in p]
         except Exception as ex:
-            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh debug_security params: {ex}")
+            logger.warning(f"[ParameterAssembler][LLM] Lỗi sinh debug_security params: {sanitize_for_log(str(ex))}")
         return []
 
     # ──────────────────────────────────────────────────────────────────────

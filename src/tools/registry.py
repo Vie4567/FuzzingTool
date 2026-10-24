@@ -34,11 +34,12 @@ class Tool:
         """Thực thi công cụ và chuẩn hóa kết quả đầu ra."""
         try:
             result = self.func(**kwargs)
+            success = not isinstance(result, dict) or result.get("success", True) is not False
             return {
-                "success": True,
+                "success": success,
                 "tool_name": self.name,
                 "result": result,
-                "error": None,
+                "error": result.get("error_message") if not success else None,
             }
         except Exception as exc:
             logger.error(f"Lỗi khi thực thi tool {self.name}: {exc}")
