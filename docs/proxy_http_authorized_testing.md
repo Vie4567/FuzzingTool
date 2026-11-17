@@ -14,7 +14,9 @@ Mỗi lần chạy lưu `progress.log`, `preflight.json`, `result.json` và `rep
 
 Chế độ `engine="proxy_http"` gửi request HTTP thật lần lượt qua các proxy HTTP trong `ProxyProfilePool`. Nguồn proxy có thể là danh sách thủ công hoặc [ProxyScrape Free Proxy List](https://proxyscrape.com/free-proxy-list). `ffuf_cli` và `python_http` vẫn dùng một proxy cố định; tính năng pool và tự cập nhật thuộc backend `proxy_http`.
 
-Mỗi request chọn một profile theo vòng tròn: `egress-a`, `egress-b`, rồi `egress-a`. Việc chọn hai proxy chỉ tạo ra hai tuyến gửi; chúng có thể dùng chung một IP egress. Tool không suy ra IP công cộng từ hostname của proxy và không gọi dịch vụ kiểm tra IP bên ngoài. `proxy_profile_id` ghi tuyến được chọn, còn `egress_ip` là `null` khi chưa có bằng chứng từ log server hoặc phép đo độc lập.
+Trong Fuzzing, mỗi request chọn một profile theo vòng tròn: `egress-a`, `egress-b`, rồi `egress-a`. Việc chọn hai proxy chỉ tạo ra hai tuyến gửi; chúng có thể dùng chung một IP egress. Tool không suy ra IP công cộng từ hostname của proxy và không gọi dịch vụ kiểm tra IP bên ngoài. `proxy_profile_id` ghi tuyến được chọn, còn `egress_ip` là `null` khi chưa có bằng chứng từ log server hoặc phép đo độc lập.
+
+Trong Coordinator, Parameter và Soft404 dùng lại pool đã hoàn tất Fuzzing. Hai module xoay giữa endpoint, giữ cùng tuyến cho baseline/control/candidate trong một nhóm để tránh kết luận sai do nội dung khác nhau theo IP. Pool được giữ ổn định trong bước kiểm chứng; lỗi/chặn dừng cả bước, không thử lại trên proxy khác hoặc quay về direct. Recon vẫn đi trực tiếp. Xem [lệnh chạy toàn pipeline với token](coordinator_auth_proxy_cli.md).
 
 ## Cấu hình proxy và phạm vi
 
@@ -126,6 +128,40 @@ HTTP 429 đầu tiên hoặc ba HTTP 403 liên tiếp trong fuzzing dừng toàn
 
 Trong bước kiểm tra sức khỏe, lỗi kết nối khiến ứng viên bị loại và engine có thể kiểm tra ứng viên tiếp theo trong cùng ngân sách. Nếu bước này nhận HTTP 403/429/407 thì dừng toàn phiên, không thử proxy khác. Lý do dừng tương ứng là `proxy_healthcheck_http_403`, `rate_limited_429` hoặc `proxy_authentication_required`. Kiểm tra sức khỏe và fuzzing dùng chung tốc độ, thời gian và số request tối đa.
 
+### Phản hồi HTTPS CONNECT từ proxy
+
+Trước khi gửi HTTPS tới website, proxy phải chấp nhận CONNECT. Nếu proxy trả
+403, 429 hoặc 407 tại bước này, cả healthcheck lẫn fuzzing dừng ngay trong
+engine; không thử profile tiếp theo, tải lại pool để chạy tiếp hoặc kết nối
+trực tiếp. Điều kiện này cũng áp dụng khi đã đọc được status nhưng các header
+tiếp theo bị lỗi hoặc vượt giới hạn.
+
+| CONNECT status | `stop_reason` |
+| --- | --- |
+| 403 | `proxy_connect_http_403` |
+| 429 | `rate_limited_429` |
+| 407 | `proxy_authentication_required` |
+
+Mã đo từ proxy nằm ở `proxy_connect_status`; `Retry-After`, nếu đọc được, nằm
+ở `proxy_connect_headers`. Khi CONNECT bị từ chối, chưa có phản hồi website:
+`status_code` và `content_length` giữ `null`, `headers` là `{}`. Log `RESULT`
+hiện riêng `status=None connect_status=403` (hoặc 429/407), không gán mã proxy
+cho website. Reason phrase, body và header tùy ý của proxy không được lưu;
+thông tin đăng nhập proxy được che trong metadata được chọn.
+
+`stats.proxy_connect_errors` và `stats.proxy_connect_status_codes` ghi riêng
+lỗi CONNECT, đồng thời có các trường tương ứng trong `stats.proxy_profiles`.
+Các lỗi này tính vào `error_rate`, nhưng không tính thành `network_errors`,
+response của website hoặc byte body website. Số lần thử vẫn dùng chung ngân
+sách request. 407 loại profile khỏi pool; 403/429 trong healthcheck đánh dấu
+kiểm tra đã dừng, không kết luận proxy chết.
+
+Nếu chưa đọc được status CONNECT, lỗi socket vẫn là lỗi mạng. CONNECT khác
+200/403/429/407 được ghi riêng là `proxy_connect_error`; healthcheck có thể
+loại ứng viên và kiểm tra ứng viên tiếp theo trong ngân sách hiện có, còn
+fuzzing dừng. CONNECT 200 tiếp tục dùng xác thực TLS và tách biệt proxy auth
+với Authorization của website như trước.
+
 ## Đối chiếu kết quả cho tiểu luận
 
 Giữ JSON kết quả, ID profile, số request/response thực tế và log server trong cùng thời gian thí nghiệm. Đối chiếu `proxy_profile_id` với IP nguồn mà server đích thực sự ghi nhận. Hai tuyến chỉ được kết luận có egress khác nhau sau khi có bằng chứng này; giữ nguyên `egress_ip=null` nếu chưa quan sát được.
@@ -159,7 +195,7 @@ Get-Content -LiteralPath "output_samples\diagnostics\<thư-mục-phiên>\progres
 
 `egress_ip` vẫn là `null` nếu chưa đối chiếu IP nguồn trong log server đích. Việc thấy các ID profile luân phiên chỉ xác nhận lựa chọn tuyến; chưa chứng minh IP công cộng đã thay đổi. Lỗi proxy, 429 hoặc ba 403 liên tiếp dừng toàn phiên trước khi dùng tuyến tiếp theo.
 
-Đánh giá hiệu năng bằng `stats.proxy_profiles`: số request/response, thời gian và tỷ lệ lỗi theo ID proxy. `error_rate` là số lần gặp lỗi mạng hoặc HTTP từ 400 trở lên chia tổng request; `avg_response_time` là thời gian trung bình của mọi lần thử, gồm cả timeout, và là `null` khi chưa có request. `stats.total_requests` gộp `healthcheck_requests` và `fuzzing_requests`; không tính các request tải danh sách gửi tới ProxyScrape thành request fuzzing của website. Không xem thời gian kiểm tra proxy là thời gian dò endpoint. Các phép đo lỗi kết nối giữ status/body length không có giá trị HTTP thay vì điền số liệu giả.
+Đánh giá hiệu năng bằng `stats.proxy_profiles`: số request/response, thời gian và tỷ lệ lỗi theo ID proxy. `error_rate` là số lần gặp lỗi mạng, CONNECT bị từ chối hoặc HTTP từ 400 trở lên chia tổng request; `avg_response_time` là thời gian trung bình của mọi lần thử, gồm cả timeout, và là `null` khi chưa có request. `stats.total_requests` gộp `healthcheck_requests` và `fuzzing_requests`; không tính các request tải danh sách gửi tới ProxyScrape thành request fuzzing của website. Không xem thời gian kiểm tra proxy là thời gian dò endpoint. Các phép đo lỗi kết nối giữ status/body length không có giá trị HTTP thay vì điền số liệu giả.
 
 ## Nhập proxy vào cấu hình cục bộ
 

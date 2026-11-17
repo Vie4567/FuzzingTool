@@ -24,6 +24,7 @@ from src.coordinator.logger import (
     COLOR_RESET,
 )
 from src.agents.base_agent import BaseAutonomousAgent
+from src.coordinator.llm_logging import sanitize_for_log
 from src.agents.endpoint_assembler import EndpointAssembler
 from src.tools.registry import default_registry
 
@@ -210,6 +211,22 @@ class FuzzingAgent(BaseAutonomousAgent):
             max_pattern_endpoints: Giới hạn endpoints sinh ra từ Pattern Engine.
             selected_pattern_ids: Override pattern selection thủ công.
         """
+        options = {}
+
+        def redact(value):
+            # ToolResult failures return normally: they need the same known
+            # credential masking as raised exceptions before logging/model use.
+            private_keys = ("proxy", "post_data", "body",
+                            "cookie", "token", "bearer_token", "api_key", "password")
+            known = [source[key] for source in (config_adjustments, options)
+                     for key in private_keys if key in source]
+            for source in (config_adjustments, options):
+                known.append({key: value for key, value in (source.get("headers") or {}).items()
+                              if key.lower() not in {"user-agent", "accept", "accept-encoding",
+                                                     "accept-language", "content-type"}})
+                known.extend(row.get("url") for row in source.get("proxy_profiles", []) if isinstance(row, dict))
+            return sanitize_for_log({"credentials": known, "payload": value})["payload"]
+
         log_agent_start("FuzzingAgent", target_url, params={
             "wordlist_size": len(wordlist),
             "waf_detected": waf_detected,
@@ -258,6 +275,7 @@ class FuzzingAgent(BaseAutonomousAgent):
                 "tool_knowledge_reference": self.ffuf_knowledge,
                 "operating_principles": self.principles,
             }
+            task_directive = redact(task_directive)
 
             fuzz_tools = self.tool_registry.list_tools(filter_names=["ffuf_fuzzing_tool"])
             execution_history = []
@@ -279,13 +297,15 @@ class FuzzingAgent(BaseAutonomousAgent):
             planned_options = self._normalize_options(planned_options)
             caller_options = self._normalize_options(config_adjustments)
             requested_engine = caller_options.get("engine", planned_options.get("engine", "auto"))
+            # Routing, origin and TLS policy belong to the operator for every
+            # engine. A direct run must not inherit a fixed proxy from a model
+            # plan merely because it did not opt into the rotating proxy mode.
+            from src.tools.proxy_profiles import OPERATOR_NETWORK_OPTIONS
+            for key in OPERATOR_NETWORK_OPTIONS:
+                planned_options.pop(key, None)
             if requested_engine == "proxy_http":
                 if caller_options.get("engine") != "proxy_http":
                     raise ValueError("proxy_http must be explicitly selected by the caller")
-                # The LLM cannot invent routing credentials or expand approved scope.
-                from src.tools.proxy_profiles import OPERATOR_PROXY_OPTIONS
-                for key in OPERATOR_PROXY_OPTIONS:
-                    planned_options.pop(key, None)
                 proxy_defaults = self.ffuf_knowledge.get("controlled_proxy_mode", {}).get(
                     "safe_execution_defaults", {"max_scan_seconds": 120, "max_requests": 100}
                 )
@@ -301,6 +321,10 @@ class FuzzingAgent(BaseAutonomousAgent):
             options["target_url"] = target_url
             options["wordlist"] = merged_wordlist
             options["waf_detected"] = waf_detected
+            # Reasons are free-form model text; unlike options, they never
+            # need to carry the operator's private values to the HTTP engine.
+            plan = {**plan, **{key: redact(plan[key]) for key in
+                              ("tool_selection_reason", "options_selection_reason") if key in plan}}
 
             # ── Phase 2: Gọi Tool ────────────────────────────────────────
             tool_execution_res = self.tool_registry.execute_tool(selected_tool, options)
@@ -310,13 +334,23 @@ class FuzzingAgent(BaseAutonomousAgent):
             tool_data = tool_result.get("result_data")
             if not isinstance(tool_data, dict) or "results" not in tool_data:
                 raise RuntimeError(tool_result.get("error_message") or "Fuzzing tool returned no measurements")
+            tool_data = {**tool_data, **{key: redact(tool_data[key]) for key in
+                                        ("errors", "warnings", "stop_reason") if key in tool_data}}
             if tool_data.get("simulated"):
                 raise RuntimeError("Simulated fuzzing data is not accepted as HTTP measurements")
             results_list = tool_data["results"]
             if not isinstance(results_list, list):
                 raise ValueError("Fuzzing measurements must be a list")
+            if any(not isinstance(row, dict) for row in results_list):
+                raise ValueError("Fuzzing measurements must contain objects")
+            # Clean the batch once. Encode record fields as pairs so the generic
+            # sanitizer does not erase entire measured response-header maps;
+            # credentials inside them are still masked, numbers stay unchanged.
+            results_list = [dict(row) for row in redact([list(row.items()) for row in results_list])]
             stats_dict = self._observed_stats(tool_data, results_list)
-            success = bool(tool_execution_res.get("success") and tool_result.get("success", True))
+            success = bool(tool_execution_res.get("success") and tool_result.get("success", True)
+                           and not tool_data.get("errors") and not tool_data.get("partial")
+                           and tool_data.get("completed") is not False)
             partial = bool(tool_data.get("partial") or tool_data.get("stopped_early") or not success)
             public_options = self._public_options(options)
             request_total = stats_dict.get("total_requests")
@@ -351,24 +385,38 @@ class FuzzingAgent(BaseAutonomousAgent):
             )
 
             # ── Phase 3: LLM Justification ───────────────────────────────
-            justification = self.generate_justification(
-                task_directive=task_directive,
-                execution_history=execution_history,
-                extracted_data={
-                    "http_200_count": stats_dict.get("status_codes", {}).get("200", 0),
-                    "total_requests": request_total,
-                    "engine": tool_data.get("engine"),
-                    "partial": partial,
-                    "stop_reason": tool_data.get("stop_reason"),
-                    "pattern_endpoints_added": len(
-                        pattern_assembly_result.get("endpoints", [])
-                    ),
-                }
-            ) if success else (
-                f"Fuzzing dừng với kết quả một phần/lỗi: {tool_data.get('stop_reason') or tool_result.get('error_message')}. "
-                f"Giữ nguyên {len(results_list)} bản ghi đo được; không tạo dữ liệu thay thế hoặc xác minh giả."
+            measured_errors = list(tool_data.get("errors") or [])
+            stop_reason = tool_data.get("stop_reason")
+            error_message = redact(tool_result.get("error_message"))
+            justification = (
+                f"Fuzzing stopped: {stop_reason or error_message}. "
+                f"Preserved {len(results_list)} measured records."
             )
+            try:
+                if success:
+                    justification = self.generate_justification(
+                        task_directive=task_directive,
+                        execution_history=execution_history,
+                        extracted_data={
+                            "http_200_count": stats_dict.get("status_codes", {}).get("200", 0),
+                            "total_requests": request_total,
+                            "engine": tool_data.get("engine"),
+                            "partial": partial,
+                            "stop_reason": tool_data.get("stop_reason"),
+                            "pattern_endpoints_added": len(pattern_assembly_result.get("endpoints", [])),
+                        },
+                    )
+            except Exception:
+                # Measurements already exist. A failed optional explanation
+                # must not discard them or trigger a replacement scan.
+                success, partial = False, True
+                stop_reason = "llm_justification_failed"
+                error_message = "Fuzzing explanation failed; measured HTTP results preserved."
+                justification = error_message
+                measured_errors.append({"error_type": "llm_justification_error",
+                                        "error": error_message, "source": "FuzzingAgent.generate_justification"})
 
+            justification = redact(justification)
             agent_logger.info(
                 f"\n{COLOR_CYAN}📝 [SUB-AGENT JUSTIFICATION - FuzzingAgent]{COLOR_RESET}\n"
                 f"{justification}\n"
@@ -376,19 +424,39 @@ class FuzzingAgent(BaseAutonomousAgent):
 
             res = {
                 "success": success,
+                "completed": success and tool_data.get("completed", True),
                 "partial": partial,
                 "simulated": False,
                 "engine": tool_data.get("engine"),
                 "results": results_list,
                 "stats": stats_dict,
-                "errors": tool_data.get("errors", []),
+                "errors": measured_errors,
                 "warnings": tool_data.get("warnings", []),
-                "stop_reason": tool_data.get("stop_reason"),
-                "error_message": tool_result.get("error_message"),
+                "stop_reason": stop_reason,
+                "error_message": error_message,
                 "tools_executed": execution_history,
                 "subagent_justification": justification,
                 "pattern_assembly": pattern_assembly_result,
                 "merged_wordlist_size": len(merged_wordlist),
+            }
+            # Public transport facts let downstream verification preserve the
+            # actual route/auth context without exporting credential values.
+            measured_settings = tool_data.get("settings") or {}
+            used_engine = tool_data.get("engine")
+            route = "direct" if used_engine in {"python_http", "ffuf_cli"} else "unknown"
+            if used_engine == "proxy_http" or options.get("proxy") or measured_settings.get("fixed_proxy_configured"):
+                route = "proxy"
+            elif used_engine == "loopback_lab" or any(options.get(key) for key in ("lab_source_ips", "source_ip", "source_address")):
+                route = "source_bound"
+            res["verification_context"] = {
+                "route": route,
+                "auth_matches_operator": (options.get("headers") or {}) == (caller_options.get("headers") or {}),
+                "operator_headers_configured": "headers" in caller_options,
+                "rate_limit": measured_settings.get("rate_limit", options.get("rate_limit", 2)),
+                "delay_ms": measured_settings.get("delay_ms", options.get("delay_ms", 0)),
+                "http_method": str(options.get("http_method", "GET")).upper(),
+                "request_has_body": options.get("post_data") is not None,
+                "headers_templated": any("FUZZ" in str(value) for value in (options.get("headers") or {}).values()),
             }
             for field in ("health_checks", "proxy_pool", "proxy_refresh_events", "settings"):
                 if field in tool_data:
@@ -396,7 +464,7 @@ class FuzzingAgent(BaseAutonomousAgent):
 
             if not success:
                 logger.warning("Fuzzing stopped with partial/failed measurements: %s",
-                               tool_result.get("error_message") or tool_data.get("stop_reason"))
+                               error_message or stop_reason)
                 return res
             log_agent_success(
                 "FuzzingAgent",
@@ -411,5 +479,8 @@ class FuzzingAgent(BaseAutonomousAgent):
             return res
 
         except Exception as e:
-            log_agent_error("FuzzingAgent", f"Lỗi trong quá trình fuzzing {target_url}", exception=e)
-            raise e
+            safe_error = sanitize_for_log({
+                "credentials": [config_adjustments, locals().get("options", {})], "value": str(e)
+            })["value"]
+            log_agent_error("FuzzingAgent", "Fuzzing execution failed", exception=RuntimeError(safe_error))
+            raise

@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from .telemetry import invoke_measured
+
 
 _REDACTED = "[REDACTED]"
 _WRITE_LOCK = threading.Lock()
@@ -258,8 +260,8 @@ def invoke_logged(runnable: Any, input_value: Any, *, component: str,
         "operation": operation,
     }
     try:
-        response = runnable.invoke(input_value)
-    except Exception as error:
+        response = invoke_measured(runnable, input_value, component=component)
+    except BaseException as error:
         try:
             error_message = str(error)
             for text in sorted(_input_texts(input_value), key=len, reverse=True):

@@ -15,24 +15,232 @@ import os
 import json
 import uuid
 import logging
+from copy import deepcopy
+from contextvars import ContextVar
+from contextlib import ExitStack
+from functools import wraps
 from datetime import datetime, timezone
 
-from langchain_openai import ChatOpenAI
+from .llm_client import DeadlineChatOpenAI as ChatOpenAI
 from langgraph.graph import StateGraph, END
 
-from .state import SharedState
+from .state import SharedState, lifecycle_summary
 from .guards import CircuitBreaker, LLMCallLimiter, TarpitDetector
 from .decision_engine import DecisionEngine
 from .knowledge_store import KnowledgeStore
 from .logger import log_decision, log_agent_skip, log_pipeline_summary
+from .llm_logging import sanitize_for_log
+from .telemetry import telemetry_session, telemetry_phase, sync_state, current_telemetry
+from .artifacts import RunArtifacts, ArtifactWriteError
+from .validation import validate_pipeline_input, validate_wordlist, InputValidationError
+from .runtime import runtime_session, current_runtime, check_deadline, snapshot as runtime_snapshot
+from ..tools.recon_http import recon_options_from_config
 
 from ..agents.tech_recon import TechReconAgent
 from ..agents.wordlist_gen import WordlistGenAgent
 from ..agents.fuzzer import FuzzingAgent
-from ..agents.param_discovery import ParamDiscoveryAgent
-from ..agents.soft404_filter import Soft404FilterAgent
+from ..agents.param_discovery import ParamDiscoveryAgent, parameter_options_from_config
+from ..agents.soft404_filter import Soft404FilterAgent, soft404_options_from_config
 
 logger = logging.getLogger(__name__)
+
+_active_run = ContextVar("coordinator_active_run", default=None)
+_EXECUTION_NODES = {"run_tech_recon": "tech_recon", "run_wordlist_gen": "wordlist_gen",
+                    "run_fuzzing": "fuzzing", "run_param_discovery": "param_disc", "run_soft404_filter": "soft404_filter"}
+
+
+def _output(result, fields, agent):
+    if not isinstance(result, dict) or not result:
+        raise ValueError(f"{agent} returned an empty or non-object result")
+    for key, kind in fields.items():
+        if key not in result or not isinstance(result[key], kind):
+            raise ValueError(f"{agent} result requires {key} ({kind.__name__})")
+    return result
+
+
+def _sync_fuzzing_errors(state, errors):
+    """Summarize this execution once; keep per-request evidence in artifacts.
+
+    Messages and source labels are deliberately fixed: network exception text
+    can contain credentials, full URLs or request bodies. A retry has its own
+    attempt number; replaying a checkpoint replaces only that attempt's summary.
+    """
+    attempt = state.get("agent_attempts", {}).get("fuzzing", 1)
+    source = "fuzzing_execution.errors"
+    counts = {}
+    for row in errors:
+        row = row if isinstance(row, dict) else {"error": str(row)}
+        text = str(row.get("error", row.get("message", ""))).lower()
+        if row.get("error_type") in {"llm_justification_error", "engine_error"}:
+            kind = row["error_type"]
+        elif row.get("proxy_connect_status") is not None:
+            kind = "proxy_connect_error"
+        elif "timeout" in text or "timed out" in text:
+            kind = "timeout"
+        elif "gaierror" in text or "name resolution" in text or "getaddrinfo" in text:
+            kind = "dns_error"
+        elif "refused" in text or "10061" in text:
+            kind = "connection_refused"
+        elif row.get("status_code") is not None:
+            kind = "response_read_error"
+        else:
+            kind = "transport_error"
+        count = row.get("count", 1)
+        count = count if type(count) is int and count > 0 else 1
+        counts[kind] = counts.get(kind, 0) + count
+    messages = {
+        "llm_justification_error": "Fuzzing explanation failed; measured HTTP results preserved.",
+        "engine_error": "Fuzzing process or output parsing failed; see artifacts.",
+        "timeout": "HTTP request timed out.",
+        "dns_error": "Target or proxy name resolution failed.",
+        "connection_refused": "Target or proxy connection was refused.",
+        "proxy_connect_error": "Proxy CONNECT did not establish the tunnel.",
+        "response_read_error": "HTTP headers were received but body measurement failed.",
+        "transport_error": "HTTP transport failed; see sanitized per-request artifacts.",
+    }
+    previous = state.setdefault("error_log", [])
+    state["error_log"] = [row for row in previous if not (
+        row.get("agent") == "fuzzing" and row.get("source") == source
+        and row.get("attempt") == attempt)]
+    timestamp = datetime.now(timezone.utc).isoformat()
+    state["error_log"].extend({
+        "agent": "fuzzing", "error_type": kind, "message": messages[kind],
+        "error": messages[kind], "count": count, "timestamp": timestamp,
+        "source": source, "attempt": attempt,
+    } for kind, count in sorted(counts.items()))
+
+
+def _recon_execution(result):
+    """Normalize Recon status without estimating request/response measurements."""
+    if "execution" not in result:
+        # Older integrations expose only the original two-field contract. Keep
+        # that interface usable, while explicitly marking measurement coverage.
+        return {"status": "completed", "success": True, "completed": True,
+                "partial": False, "stop_reason": "completed", "errors": [],
+                "stats": {}, "channels": {}, "measurement_status": "legacy_unreported"}
+    execution = deepcopy(result["execution"])
+    if (not isinstance(execution, dict)
+            or execution.get("status") not in {"completed", "partial", "failed"}
+            or not isinstance(execution.get("errors", []), list)
+            or not isinstance(execution.get("stats", {}), dict)):
+        raise ValueError("Recon execution requires a status, errors list and stats object")
+    errors, stats = execution.setdefault("errors", []), execution.setdefault("stats", {})
+    status = execution["status"]
+    responses, attempts = stats.get("responses_received"), stats.get("attempted_requests")
+    network_errors = stats.get("network_errors", 0)
+    has_errors = bool(errors) or (type(network_errors) is int and network_errors > 0)
+    incomplete = (has_errors or execution.get("success") is False
+                  or execution.get("completed") is False or execution.get("partial") is True
+                  or execution.get("stop_reason") not in (None, "", "completed"))
+    if type(attempts) is int and attempts > 0 and type(responses) is int and responses == 0:
+        status = "failed"
+    elif status == "completed" and incomplete:
+        status = "partial" if type(responses) is int and responses > 0 else "failed"
+    execution.update(status=status, success=status == "completed", completed=status == "completed",
+                     partial=status == "partial")
+    if status != "completed" and execution.get("stop_reason") in (None, "", "completed"):
+        execution["stop_reason"] = "recon_incomplete"
+    return execution
+
+
+def _sync_recon_errors(state, errors):
+    """Keep occurrence counts once per attempt; detailed evidence stays in Recon."""
+    attempt = state.get("agent_attempts", {}).get("tech_recon", 1)
+    source = "recon_execution.errors"
+    safe = sanitize_for_log({"credentials": state.get("config", {}), "value": errors})["value"]
+    counts = {}
+    for row in safe:
+        row = row if isinstance(row, dict) else {}
+        # Never copy arbitrary exception messages/URLs into compact error logs.
+        kind = str(row.get("error_type", "recon_error"))[:64]
+        channel = str(row.get("channel", "recon"))[:64]
+        count = row.get("count", 1)
+        count = count if type(count) is int and count > 0 else 1
+        counts[(channel, kind)] = counts.get((channel, kind), 0) + count
+    state["error_log"] = [row for row in state.setdefault("error_log", []) if not (
+        row.get("agent") == "tech_recon" and row.get("source") == source and row.get("attempt") == attempt)]
+    timestamp = datetime.now(timezone.utc).isoformat()
+    state["error_log"].extend({
+        "agent": "tech_recon", "channel": channel, "error_type": kind,
+        "message": "Recon channel did not complete; see sanitized execution evidence.",
+        "error": "Recon channel did not complete; see sanitized execution evidence.",
+        "count": count, "timestamp": timestamp, "source": source, "attempt": attempt,
+    } for (channel, kind), count in sorted(counts.items()))
+
+
+def _apply_decision(state, decision, retry_agent=None):
+    if not isinstance(decision, dict) or not isinstance(decision.get("action"), str):
+        raise ValueError("Coordinator decision must contain an action")
+    action = decision["action"]
+    config = state.get("config", {})
+    reason = None
+    if action.startswith("retry"):
+        if not retry_agent or state.get("retry_counts", {}).get(retry_agent, 0) >= config.get("max_retries", 2):
+            reason = "max_retries"
+        elif retry_agent == "fuzzing" and state.get("fuzzing_execution", {}).get("stop_reason") not in (None, "", "completed"):
+            reason = "upstream_stop"
+    if state.get("iteration_count", 0) >= config.get("max_iterations", 20):
+        reason = "max_iterations"
+    budget = current_runtime()
+    if budget and budget.stop_reason:
+        reason = budget.stop_reason
+    if reason:
+        action = "abort_to_report"
+        state["stop_reason"] = reason
+        state["audit_log"].append({"type": "guard_rail_override", "reason": reason,
+                                   "original_action": decision["action"], "action": action})
+    elif action == "skip_to_filter" and config.get("run_all_modules") and any(
+            row.get("status_code") == 200 for row in state.get("raw_results", [])):
+        action = "proceed_to_param"
+        state["audit_log"].append({"type": "operator_routing", "reason": "run_all_modules",
+                                   "original_action": decision["action"], "action": action})
+    if action == "abort_to_report":
+        state.setdefault("stop_reason", "decision_aborted")
+    state["_last_decision_action"] = action
+    adjustments = decision.get("next_agent_config_adjustments", {})
+    if not isinstance(adjustments, dict):
+        raise ValueError("Coordinator configuration adjustments must be an object")
+    state["_config_adjustments"] = adjustments
+
+
+def _checkpointed(node):
+    """Keep partial state even if a graph node raises before returning it."""
+    @wraps(node)
+    def execute(state):
+        run = _active_run.get()
+        if run is None:
+            return node(state)
+        run["state"], run["node"] = state, node.__name__
+        sync_state(state)
+        run["artifacts"].save(state, node=node.__name__, event="started")
+        completed = False
+        with telemetry_phase(node.__name__):
+            try:
+                if node.__name__ not in {"validate_input", "init_state", "generate_report"}:
+                    check_deadline()
+                if node.__name__ in _EXECUTION_NODES:
+                    agent = _EXECUTION_NODES[node.__name__]
+                    attempts = state.setdefault("agent_attempts", {})
+                    count = attempts.get(agent, 0)
+                    if count > state.get("config", {}).get("max_retries", 2):
+                        raise RuntimeError("max_retries")
+                    if state.get("iteration_count", 0) >= state.get("config", {}).get("max_iterations", 20):
+                        raise RuntimeError("max_iterations")
+                    attempts[agent] = count + 1
+                    state.setdefault("retry_counts", {})[agent] = count
+                    state["iteration_count"] = state.get("iteration_count", 0) + 1
+                result = node(state)
+                if not isinstance(result, dict):
+                    raise ValueError("Coordinator node returned a non-object state")
+                run["state"] = result
+                completed = True
+                return result
+            finally:
+                sync_state(run["state"])
+                run["state"]["runtime"] = runtime_snapshot()
+                run["artifacts"].save(run["state"], node=node.__name__,
+                                      event="checkpoint" if completed else "interrupted")
+    return execute
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -78,6 +286,11 @@ def _get_decision_engine(config: dict = None) -> DecisionEngine:
         kwargs = {
             "model": model_name,
             "temperature": temperature,
+            # Count one provider attempt per logged invocation; SDK retries
+            # would otherwise be invisible to application telemetry.
+            "max_retries": 0,
+            "timeout": config.get("llm_timeout_seconds", 30),
+            "max_tokens": config.get("llm_max_tokens", 4096),
         }
         if api_key:
             kwargs["api_key"] = api_key
@@ -99,18 +312,27 @@ def _get_decision_engine(config: dict = None) -> DecisionEngine:
 # NODE FUNCTIONS — Agent Execution
 # ═══════════════════════════════════════════════════════════════
 
+@_checkpointed
 def validate_input(state: dict) -> dict:
     """Node: Validate URL đầu vào."""
     url = state.get("target_url", "")
 
-    if not url or not url.startswith(("http://", "https://")):
+    try:
+        if state.get("_input_validated"):
+            config = state["config"]
+        else:
+            url, config = validate_pipeline_input(url, state.get("config"))
+        state["target_url"], state["config"] = url, config
+        state["input_wordlist"] = config.get("wordlist", [])
+    except (InputValidationError, TypeError, ValueError) as exc:
         state["agent_statuses"]["validate"] = "failed"
         state["audit_log"].append({
             "type": "validation_failed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "detail": f"URL không hợp lệ: '{url}'",
+            "detail": str(exc),
         })
-        logger.error(f"[Coordinator] Invalid URL: '{url}'")
+        state.setdefault("error_log", []).append({"agent": "validate", "error": str(exc)})
+        logger.error("[Coordinator] Input validation failed: %s", exc)
     else:
         state["agent_statuses"]["validate"] = "success"
         state["audit_log"].append({
@@ -123,10 +345,11 @@ def validate_input(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def init_state(state: dict) -> dict:
     """Node: Khởi tạo SharedState đầy đủ + Knowledge context."""
-    state["session_id"] = str(uuid.uuid4())
-    state["started_at"] = datetime.now(timezone.utc).isoformat()
+    state["session_id"] = state.get("session_id") or str(uuid.uuid4())
+    state["started_at"] = state.get("started_at") or datetime.now(timezone.utc).isoformat()
 
     state["agent_statuses"] = {
         "validate": state.get("agent_statuses", {}).get("validate", "success"),
@@ -142,6 +365,8 @@ def init_state(state: dict) -> dict:
 
     # Agent outputs
     state.setdefault("tech_stack", {})
+    state.setdefault("recon_profile", {})
+    state.setdefault("recon_execution", {})
     state.setdefault("discovered_paths", [])
     state.setdefault("js_endpoints", [])
     state.setdefault("waf_detected", False)
@@ -152,6 +377,10 @@ def init_state(state: dict) -> dict:
     state.setdefault("raw_results", [])
     state.setdefault("fuzzing_stats", {})
     state.setdefault("param_results", [])
+    state.setdefault("parameter_candidates", [])
+    state.setdefault("verified_parameters", [])
+    state.setdefault("parameter_stats", {})
+    state.setdefault("parameter_verification_status", "not_checked")
     state.setdefault("verified_results", [])
     state.setdefault("unverified_results", [])
     state.setdefault("verification_status", "not_checked")
@@ -188,6 +417,7 @@ def init_state(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def run_tech_recon(state: dict) -> dict:
     """Node: Agent 1 — Tech Recon."""
     state["agent_statuses"]["tech_recon"] = "running"
@@ -199,22 +429,57 @@ def run_tech_recon(state: dict) -> dict:
 
     try:
         engine = _get_decision_engine(state.get("config"))
-        agent = TechReconAgent(llm=engine.llm if engine else None)
+        agent = TechReconAgent(llm=engine.llm if engine else None,
+                               **recon_options_from_config(state.get("config")))
         result = agent.execute(state["target_url"])
+        _output(result, {"tech_stack": dict, "discovered_paths": list}, "Recon")
+        result = sanitize_for_log({"credentials": state.get("config", {}), "value": result})["value"]
+        execution = _recon_execution(result)
+        previous = state.get("recon_execution", {})
+        responses = execution.get("stats", {}).get("responses_received")
+        retain_profile = (bool(state.get("recon_profile")) and execution["status"] == "failed"
+                          and type(responses) is int and responses == 0)
 
-        state["tech_stack"] = result.get("tech_stack", {})
-        state["discovered_paths"] = result.get("discovered_paths", [])
-        state["js_endpoints"] = result.get("js_endpoints", [])
-        state["waf_detected"] = result.get("waf_detected", False)
-        state["waf_type"] = result.get("waf_type", None)
-        # Recon has no complete request telemetry; do not report an invented zero.
-        state["total_http_requests"] = None
+        if not retain_profile:
+            state["tech_stack"] = result.get("tech_stack", {})
+            state["discovered_paths"] = result.get("discovered_paths", [])
+            state["js_endpoints"] = result.get("js_endpoints", [])
+            state["waf_detected"] = result.get("waf_detected", False)
+            state["waf_type"] = result.get("waf_type", None)
+        state["recon_http_policy"] = result.get("http_policy", {})
+        profile = result.get("recon_profile")
+        if profile is not None and not isinstance(profile, dict):
+            raise ValueError("Recon profile must be an object")
+        # Legacy fields remain available; the full structured evidence lives in
+        # one canonical profile instead of duplicating forms/schema across state.
+        if not retain_profile:
+            state["recon_profile"] = deepcopy(profile) if profile is not None else {
+                "schema_version": 1, "target_url": state["target_url"],
+                "tech_stack": deepcopy(state["tech_stack"]), "paths": [],
+                "parameters": [], "forms": [], "api_context": {}, "architecture": {},
+                "measurement_status": "legacy_unreported",
+            }
+        else:
+            execution["retained_profile_attempt"] = previous.get("retained_profile_attempt") or previous.get("attempt")
+        state["recon_execution"] = execution
+        state["recon_execution"]["attempt"] = state.get("agent_attempts", {}).get("tech_recon", 1)
+        _sync_recon_errors(state, state["recon_execution"]["errors"])
+        # Only transport dispatch telemetry can supply the global count. Outside
+        # a runtime session it remains unknown rather than derived from paths.
+        if current_telemetry() is None:
+            state["total_http_requests"] = None
+        else:
+            sync_state(state)
         state.setdefault("subagent_justifications", {})["tech_recon"] = result.get("subagent_justification", "")
-        state["agent_statuses"]["tech_recon"] = "success"
-        circuit_breakers["tech_recon"].record_success()
+        execution_status = state["recon_execution"]["status"]
+        state["agent_statuses"]["tech_recon"] = "success" if execution_status == "completed" else execution_status
+        if execution_status == "completed":
+            circuit_breakers["tech_recon"].record_success()
+        elif execution_status == "failed":
+            circuit_breakers["tech_recon"].record_failure()
 
         logger.info(
-            f"[TechRecon] Success — "
+            f"[TechRecon] {execution_status} — "
             f"stack={state['tech_stack']}, "
             f"paths={len(state['discovered_paths'])}, "
             f"WAF={state['waf_type']}"
@@ -222,13 +487,22 @@ def run_tech_recon(state: dict) -> dict:
 
     except Exception as e:
         state["agent_statuses"]["tech_recon"] = "failed"
-        state["error_log"].append({
+        safe_error = sanitize_for_log({"credentials": state.get("config", {}), "value": str(e)})["value"]
+        failure = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "agent": "tech_recon",
-            "error": str(e),
-        })
+            "channel": "recon", "error_type": "agent_error", "message": safe_error, "count": 1,
+        }
+        previous = state.get("recon_execution", {})
+        state["recon_execution"] = {
+            "status": "failed", "success": False, "completed": False, "partial": False,
+            "stop_reason": "agent_error", "stats": {}, "channels": {}, "errors": [failure],
+            "attempt": state.get("agent_attempts", {}).get("tech_recon", 1),
+            "retained_profile_attempt": (previous.get("retained_profile_attempt") or previous.get("attempt"))
+                                        if state.get("recon_profile") else None,
+        }
+        _sync_recon_errors(state, [failure])
         circuit_breakers["tech_recon"].record_failure()
-        logger.error(f"[TechRecon] Failed: {e}")
+        logger.error(f"[TechRecon] Failed: {safe_error}")
 
     state["audit_log"].append({
         "type": "agent_completed",
@@ -239,6 +513,7 @@ def run_tech_recon(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def llm_decide_after_recon(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Tech Recon (Decision Point D2)."""
     engine = _get_decision_engine(state.get("config"))
@@ -248,6 +523,8 @@ def llm_decide_after_recon(state: dict) -> dict:
         f"Tech stack: {json.dumps(state.get('tech_stack', {}))}. "
         f"Paths found: {len(state.get('discovered_paths', []))}. "
         f"WAF: {state.get('waf_type', 'None')}. "
+        f"Recon execution: {state.get('recon_execution', {}).get('status', 'legacy_unreported')}; "
+        f"stop reason: {state.get('recon_execution', {}).get('stop_reason')}. "
         f"Sub-Agent Justification: {subagent_just}"
     )
 
@@ -266,13 +543,11 @@ def llm_decide_after_recon(state: dict) -> dict:
         adjustments=decision.get("next_agent_config_adjustments")
     )
 
-    state["_last_decision_action"] = decision["action"]
-    state["_config_adjustments"] = decision.get(
-        "next_agent_config_adjustments", {}
-    )
+    _apply_decision(state, decision, "tech_recon")
     return state
 
 
+@_checkpointed
 def run_wordlist_gen(state: dict) -> dict:
     """Node: Agent 2 — Wordlist Generator."""
     state["agent_statuses"]["wordlist_gen"] = "running"
@@ -289,20 +564,39 @@ def run_wordlist_gen(state: dict) -> dict:
             tech_stack=state["tech_stack"],
             discovered_paths=state["discovered_paths"],
             js_endpoints=state.get("js_endpoints", []),
+            target_url=state["target_url"],
+            recon_profile=state.get("recon_profile", {}),
         )
+        _output(result, {"wordlist": list}, "Wordlist")
 
-        llm_limiter.record_call()
-        state["llm_call_count"] += 1
         state["dev_profile"] = result.get("dev_profile")
-        state["wordlist"] = result.get("wordlist", [])
+        generated, rejected = [], 0
+        for entry in result["wordlist"]:
+            try:
+                generated.extend(validate_wordlist(state["target_url"], [entry]))
+            except InputValidationError:
+                rejected += 1
+        generated = validate_wordlist(state["target_url"], generated, allow_empty=True)
+        mode = state.get("config", {}).get("wordlist_mode", "generated")
+        provided = state.get("input_wordlist", state.get("config", {}).get("wordlist", []))
+        selected = provided if mode == "provided" else provided + generated if mode == "merge" else generated
+        state["generated_wordlist"] = generated
+        state["wordlist"] = validate_wordlist(state["target_url"], selected)
+        count = len(state["wordlist"])
+        limit = state.get("config", {}).get("max_wordlist_entries")
+        if limit:
+            state["wordlist"] = state["wordlist"][:limit]
         state["wordlist_metadata"] = result.get("metadata", {})
+        state["wordlist_metadata"].update(selection_mode=mode, generated_valid_count=len(generated),
+                                          rejected_generated_entries=rejected, selection_input_count=count,
+                                          selected_count=len(state["wordlist"]), selection_limit=limit)
         state.setdefault("subagent_justifications", {})["wordlist_gen"] = result.get("subagent_justification", "")
         state["agent_statuses"]["wordlist_gen"] = "success"
         circuit_breakers["wordlist_gen"].record_success()
 
         logger.info(
             f"[WordlistGen] Success — "
-            f"{len(state['wordlist'])} entries generated"
+            f"{len(generated)} valid candidates generated, {len(state['wordlist'])} selected"
         )
 
     except Exception as e:
@@ -324,14 +618,15 @@ def run_wordlist_gen(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def llm_decide_after_wordlist(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Wordlist Generation (Decision Point D3)."""
     engine = _get_decision_engine(state.get("config"))
 
     subagent_just = state.get("subagent_justifications", {}).get("wordlist_gen", "")
     result_summary = (
-        f"Wordlist size: {len(state.get('wordlist', []))} entries. "
-        f"Sub-Agent Justification: {subagent_just}"
+        f"Lifecycle: {json.dumps(lifecycle_summary(state))}. "
+        f"Sub-Agent Justification (unverified model explanation): {str(subagent_just)[:1000]}"
     )
 
     decision = engine.make_decision(
@@ -349,23 +644,24 @@ def llm_decide_after_wordlist(state: dict) -> dict:
         adjustments=decision.get("next_agent_config_adjustments")
     )
 
-    state["_last_decision_action"] = decision["action"]
-    state["_config_adjustments"] = decision.get(
-        "next_agent_config_adjustments", {}
-    )
+    _apply_decision(state, decision, "wordlist_gen")
     return state
 
 
+@_checkpointed
 def run_fuzzing(state: dict) -> dict:
     """Node: Agent 3 — Real HTTP fuzzing, preserving partial measurements."""
     state["agent_statuses"]["fuzzing"] = "running"
     config_adj = dict(state.get("_config_adjustments") or {})
     # Manager plans may tune measurement settings, but only operator config can
     # select a transport, provide routing credentials or define approved scope.
-    from src.tools.proxy_profiles import OPERATOR_PROXY_OPTIONS
-    for key in OPERATOR_PROXY_OPTIONS:
+    from src.tools.proxy_profiles import OPERATOR_NETWORK_OPTIONS
+    for key in OPERATOR_NETWORK_OPTIONS:
         config_adj.pop(key, None)
     config_adj.update(state.get("config", {}).get("fuzzing_options") or {})
+    if state.get("config", {}).get("max_wordlist_entries") or state.get("config", {}).get("wordlist_mode") == "provided":
+        # The selected work plan is explicit; do not silently append new paths.
+        config_adj["use_pattern_engine"] = False
     for key in ("target_url", "wordlist", "waf_detected", "waf_type", "dev_profile", "observed_urls"):
         config_adj.pop(key, None)
 
@@ -388,6 +684,7 @@ def run_fuzzing(state: dict) -> dict:
             observed_urls=list(dict.fromkeys(state.get("discovered_paths", []) + state.get("js_endpoints", []))),
             **config_adj,
         )
+        _output(result, {"results": list, "stats": dict}, "Fuzzing")
 
         state["raw_results"] = result.get("results", [])
         state["fuzzing_stats"] = result.get("stats", {})
@@ -401,9 +698,28 @@ def run_fuzzing(state: dict) -> dict:
         )
         state["fuzzing_execution"] = {
             key: result.get(key) for key in
-            ("engine", "success", "partial", "simulated", "stop_reason", "errors", "warnings", "error_message")
+            ("engine", "success", "completed", "partial", "simulated", "stop_reason", "errors", "warnings", "error_message",
+             "verification_context")
         }
-        state["agent_statuses"]["fuzzing"] = "success" if result.get("success", True) else "partial" if state["raw_results"] else "failed"
+        context = state["fuzzing_execution"].get("verification_context")
+        if isinstance(context, dict):
+            context = dict(context)
+            operator_options = state.get("config", {}).get("fuzzing_options") or {}
+            context["auth_matches_operator"] = (
+                context.get("auth_matches_operator") is True
+                and (config_adj.get("headers") or {}) == (operator_options.get("headers") or {})
+            )
+            context["operator_headers_configured"] = "headers" in operator_options
+            state["fuzzing_execution"]["verification_context"] = context
+        errors = result.get("errors") or []
+        _sync_fuzzing_errors(state, errors)
+        successful = (result.get("success", True) and not result.get("partial") and not errors
+                      and result.get("completed") is not False
+                      and result.get("stop_reason") in (None, "", "completed"))
+        if not successful:
+            state["fuzzing_execution"].update(success=False, partial=True, completed=False)
+        received = any(row.get("status_code") is not None for row in state["raw_results"])
+        state["agent_statuses"]["fuzzing"] = "success" if successful else "partial" if received else "failed"
 
         # Tarpit detection
         avg_time = result.get("stats", {}).get(
@@ -436,13 +752,18 @@ def run_fuzzing(state: dict) -> dict:
 
     except Exception as e:
         state["agent_statuses"]["fuzzing"] = "failed"
+        state.setdefault("fuzzing_execution", {}).update(success=False, partial=True, completed=False,
+                                                        stop_reason="execution_failed")
+        safe_error = sanitize_for_log({"credentials": config_adj, "value": str(e)})["value"]
         state["error_log"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent": "fuzzing",
-            "error": str(e),
+            "error_type": "execution_error", "message": safe_error, "error": safe_error,
+            "count": 1, "source": "FuzzingAgent.execute",
+            "attempt": state.get("agent_attempts", {}).get("fuzzing", 1),
         })
         circuit_breakers["fuzzing"].record_failure()
-        logger.error(f"[Fuzzing] Failed: {e}")
+        logger.error("[Fuzzing] Failed: %s", safe_error)
 
     state["audit_log"].append({
         "type": "agent_completed",
@@ -453,6 +774,7 @@ def run_fuzzing(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def llm_decide_after_fuzzing(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Fuzzing (Decision Point D4).
 
@@ -481,10 +803,12 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
     ]
     subagent_just = state.get("subagent_justifications", {}).get("fuzzing", "")
     result_summary = (
+        f"Lifecycle: {json.dumps(lifecycle_summary(state))}. "
         f"Total results: {len(state.get('raw_results', []))}. "
         f"HTTP 200: {len(http_200s)}. "
-        f"HTTP requests sent: {state.get('total_http_requests', 0)}. "
-        f"Sub-Agent Justification: {subagent_just}"
+        f"Pipeline-wide HTTP attempts (all phases): {state.get('total_http_requests')}. "
+        "HTTP 200 is not an endpoint verification. "
+        f"Sub-Agent Justification (unverified model explanation): {str(subagent_just)[:1000]}"
     )
 
     decision = engine.make_decision(
@@ -506,13 +830,11 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
         state["agent_statuses"]["param_disc"] = "skipped"
         log_agent_skip("ParamDiscoveryAgent", decision.get("reasoning", "LLM quyết định skip sang filter 404"))
 
-    state["_last_decision_action"] = decision["action"]
-    state["_config_adjustments"] = decision.get(
-        "next_agent_config_adjustments", {}
-    )
+    _apply_decision(state, decision, "fuzzing")
     return state
 
 
+@_checkpointed
 def run_param_discovery(state: dict) -> dict:
     """Node: Agent 4 — Parameter Discovery."""
     state["agent_statuses"]["param_disc"] = "running"
@@ -528,6 +850,9 @@ def run_param_discovery(state: dict) -> dict:
             for r in state.get("raw_results", [])
             if r.get("status_code") == 200
         ]
+        execution = dict(state.get("fuzzing_execution") or {})
+        if state.get("agent_statuses", {}).get("fuzzing") in {"failed", "partial"}:
+            execution.update(success=False, partial=True)
         engine = _get_decision_engine(state.get("config"))
         agent = ParamDiscoveryAgent(llm=engine.llm if engine else None)
         result = agent.execute(
@@ -535,28 +860,56 @@ def run_param_discovery(state: dict) -> dict:
             endpoints=http_200_endpoints,
             tech_stack=state.get("tech_stack", {}),
             dev_profile=state.get("dev_profile"),
+            verification_options=parameter_options_from_config(state.get("config"), execution),
         )
+        _output(result, {"param_results": list}, "Parameter")
 
-        llm_limiter.record_call()
-        state["llm_call_count"] += 1
         state["param_results"] = result.get("param_results", [])
-        state["agent_statuses"]["param_disc"] = "success"
-        circuit_breakers["param_disc"].record_success()
+        state["parameter_candidates"] = result.get("parameter_candidates", [])
+        state["verified_parameters"] = result.get("verified_parameters", [])
+        state["parameter_stats"] = result.get("stats", {})
+        state["parameter_verification_status"] = result.get("verification_status", "not_checked")
+        state["parameter_stop_reason"] = result.get("stop_reason")
+        state["parameter_http_policy"] = result.get("http_policy", {})
+        state.setdefault("subagent_justifications", {})["param_disc"] = result.get("subagent_justification", "")
+        count = result.get("stats", {}).get("total_requests", 0)
+        previous = state.get("total_http_requests")
+        state["total_http_requests"] = previous + count if isinstance(previous, int) and isinstance(count, int) else None
+        status = state["parameter_verification_status"]
+        state["agent_statuses"]["param_disc"] = (
+            "failed" if status == "failed" else "partial" if status == "partial"
+            else "skipped" if status == "skipped" else "success"
+        )
+        if status == "failed":
+            state["error_log"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(), "agent": "param_disc",
+                "error": sanitize_for_log({"credentials": state.get("config", {}),
+                                           "value": result.get("error", "Parameter verification failed")})["value"],
+            })
+            circuit_breakers["param_disc"].record_failure()
+        elif status == "completed":
+            circuit_breakers["param_disc"].record_success()
 
         logger.info(
             f"[ParamDisc] Success — "
-            f"{len(state['param_results'])} params found"
+            f"{len(state['verified_parameters'])} verified, "
+            f"{len(state['parameter_candidates'])} candidates"
         )
 
     except Exception as e:
         state["agent_statuses"]["param_disc"] = "failed"
+        state["verified_parameters"] = []
+        state["parameter_verification_status"] = "failed"
+        state["parameter_stop_reason"] = "verification_failed"
+        state["parameter_stats"] = {"total_requests": None}
+        safe_error = sanitize_for_log({"credentials": state.get("config", {}), "value": str(e)})["value"]
         state["error_log"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent": "param_disc",
-            "error": str(e),
+            "error": safe_error,
         })
         circuit_breakers["param_disc"].record_failure()
-        logger.error(f"[ParamDisc] Failed: {e}")
+        logger.error(f"[ParamDisc] Failed: {safe_error}")
 
     state["audit_log"].append({
         "type": "agent_completed",
@@ -567,6 +920,7 @@ def run_param_discovery(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def run_soft404_filter(state: dict) -> dict:
     """Node: Agent 5 — Soft 404 Filter."""
     state["agent_statuses"]["soft404_filter"] = "running"
@@ -576,21 +930,44 @@ def run_soft404_filter(state: dict) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
-    all_results = (state.get("raw_results") or []) + (state.get("param_results") or [])
+    # Parameter evidence has its own result lists; candidate containers are not
+    # endpoint measurements and must not force a completed endpoint filter to partial.
+    all_results = (state.get("raw_results") or []) + (
+        [] if state.get("parameter_verification_status") in {"completed", "partial", "failed", "skipped"}
+        else (state.get("param_results") or []))
     try:
+        execution = dict(state.get("fuzzing_execution") or {})
+        if state.get("agent_statuses", {}).get("fuzzing") in {"failed", "partial"}:
+            execution.update(success=False, partial=True)
+        # A block/transport stop during Parameter must not be bypassed by the
+        # following verification phase.
+        if state.get("parameter_verification_status") in {"partial", "failed"}:
+            execution.update(success=False, partial=True,
+                             stop_reason=state.get("parameter_stop_reason") or "parameter_incomplete")
         agent = Soft404FilterAgent()
         result = agent.execute(
             target_url=state["target_url"],
             results_to_verify=all_results,
+            **soft404_options_from_config(state.get("config"), execution),
         )
+        _output(result, {"verified": list, "unverified": list}, "Soft404")
 
         state["verified_results"] = result.get("verified", [])
         state["unverified_results"] = result.get("unverified", [])
         state["verification_status"] = result.get("verification_status", "completed")
         state["false_positives"] = result.get("false_positives", [])
         state["baseline_signature"] = result.get("baseline")
+        state["soft404_stats"] = result.get("stats", {})
+        state["soft404_stop_reason"] = result.get("stop_reason")
+        state["soft404_signals"] = result.get("equal_length_signals", [])
+        state.setdefault("subagent_justifications", {})["soft404"] = result.get("subagent_justification", "")
+        request_count = result.get("stats", {}).get("total_requests", 0)
+        previous_count = state.get("total_http_requests")
+        if isinstance(previous_count, int) and isinstance(request_count, int):
+            state["total_http_requests"] = previous_count + request_count
         state["agent_statuses"]["soft404_filter"] = (
-            "skipped" if result.get("verification_performed") is False else "success"
+            "skipped" if result.get("verification_performed") is False
+            else "partial" if result.get("verification_status") == "partial" else "success"
         )
         if state["agent_statuses"]["soft404_filter"] == "success":
             circuit_breakers["soft404"].record_success()
@@ -606,15 +983,29 @@ def run_soft404_filter(state: dict) -> dict:
         state["agent_statuses"]["soft404_filter"] = "failed"
         # Keep real measurements, without pretending they passed verification.
         state["verified_results"] = []
-        state["unverified_results"] = all_results
+        from copy import deepcopy
+        state["unverified_results"] = deepcopy(all_results)
+        for row in state["unverified_results"]:
+            if not isinstance(row, dict):
+                continue
+            row.update(verification="not_checked", verification_performed=False)
+            for key in ("similarity_to_baseline", "verification_evidence", "verification_reason"):
+                row.pop(key, None)
+        state["false_positives"] = []
+        state["baseline_signature"] = None
+        state["soft404_stats"] = {"total_requests": None}
+        state["soft404_stop_reason"] = "verification_failed"
+        state["soft404_signals"] = []
+        state.setdefault("subagent_justifications", {})["soft404"] = "Verification failed; results remain unverified."
+        state["total_http_requests"] = None
         state["verification_status"] = "failed"
         state["error_log"].append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent": "soft404_filter",
-            "error": str(e),
+            "error": sanitize_for_log({"credentials": state.get("config", {}), "value": str(e)})["value"],
         })
         circuit_breakers["soft404"].record_failure()
-        logger.error(f"[Soft404] Failed: {e}")
+        logger.error(f"[Soft404] Failed: {state['error_log'][-1]['error']}")
 
     state["audit_log"].append({
         "type": "agent_completed",
@@ -625,6 +1016,7 @@ def run_soft404_filter(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def generate_report(state: dict) -> dict:
     """Node: Tổng hợp báo cáo cuối cùng."""
     state["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -636,6 +1028,8 @@ def generate_report(state: dict) -> dict:
             "unverified": len(state.get("unverified_results", [])),
             "verification_status": state.get("verification_status", "not_checked"),
             "filtered": len(state.get("false_positives", [])),
+            "verified_parameters": len(state.get("verified_parameters", [])),
+            "parameter_candidates": len(state.get("parameter_candidates", [])),
             "decisions_made": len(state.get("decision_chain", [])),
         },
     })
@@ -648,18 +1042,23 @@ def generate_report(state: dict) -> dict:
     return state
 
 
+@_checkpointed
 def post_session_reflection(state: dict) -> dict:
     """Node: 🧠 LLM rút bài học → lưu Knowledge Store."""
-    engine = _get_decision_engine(state.get("config"))
-
+    if state.get("agent_statuses", {}).get("validate") == "failed":
+        return state
     try:
+        engine = _get_decision_engine(state.get("config"))
         engine.reflect_on_session(state)
     except Exception as e:
-        logger.error(f"[Reflection] Failed: {e}")
+        safe_error = sanitize_for_log({"credentials": state.get("config", {}), "value": str(e)})["value"]
+        logger.error(f"[Reflection] Failed: {safe_error}")
+        state.setdefault("error_log", []).append({"agent": "reflection", "error": safe_error,
+                                                 "timestamp": datetime.now(timezone.utc).isoformat()})
         state["audit_log"].append({
             "type": "reflection_failed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "error": str(e),
+            "error": safe_error,
         })
 
     return state
@@ -821,7 +1220,7 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
     Returns:
         Final SharedState dict sau khi pipeline hoàn thành
     """
-    config = config or {}
+    config = {} if config is None else config
 
     # Reset global state
     global _decision_engine
@@ -836,12 +1235,14 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
     initial_state = {
         "target_url": target_url,
         "config": config,
-        "session_id": "",
-        "started_at": "",
+        "session_id": str(uuid.uuid4()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
         "agent_statuses": {},
         "retry_counts": {},
         "tech_stack": {},
+        "recon_profile": {},
+        "recon_execution": {},
         "discovered_paths": [],
         "js_endpoints": [],
         "waf_detected": False,
@@ -852,6 +1253,10 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
         "raw_results": [],
         "fuzzing_stats": {},
         "param_results": [],
+        "parameter_candidates": [],
+        "verified_parameters": [],
+        "parameter_stats": {},
+        "parameter_verification_status": "not_checked",
         "verified_results": [],
         "unverified_results": [],
         "verification_status": "not_checked",
@@ -873,38 +1278,74 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
         f"[Coordinator v2.0] Starting pipeline for {target_url}"
     )
 
-    app = build_coordinator_graph()
-    final_state = app.invoke(initial_state)
-
-    # Tính toán duration và log tổng kết
-    start_dt = datetime.fromisoformat(final_state.get("started_at", datetime.now(timezone.utc).isoformat()))
-    finish_dt = datetime.fromisoformat(final_state.get("finished_at", datetime.now(timezone.utc).isoformat()))
-    duration = (finish_dt - start_dt).total_seconds()
-
-    log_pipeline_summary(
-        session_id=final_state.get("session_id", "unknown"),
-        target_url=target_url,
-        duration_sec=max(duration, 0.0),
-        stats={
-            "verified_results": len(final_state.get("verified_results", [])),
-            "unverified_results": len(final_state.get("unverified_results", [])),
-            "verification_status": final_state.get("verification_status", "not_checked"),
-            "false_positives": len(final_state.get("false_positives", [])),
-            "llm_calls": final_state.get("llm_call_count", 0),
-            "http_requests": final_state.get("total_http_requests", 0),
-            "decisions_made": len(final_state.get("decision_chain", [])),
-            "agent_statuses": final_state.get("agent_statuses", {}),
-        }
-    )
-
-    # Keep private routing configuration available throughout execution, then
-    # return public copies without modifying the caller's original config.
-    public_state = dict(final_state)
-    if isinstance(final_state.get("config"), dict):
-        public_config = dict(final_state["config"])
-        if isinstance(public_config.get("fuzzing_options"), dict):
-            public_config["fuzzing_options"] = FuzzingAgent._public_options(public_config["fuzzing_options"])
-        public_state["config"] = public_config
-    if isinstance(final_state.get("_config_adjustments"), dict):
-        public_state["_config_adjustments"] = FuzzingAgent._public_options(final_state["_config_adjustments"])
-    return public_state
+    # Create a durable destination before any HTTP/LLM activity. Write failures
+    # are explicit errors: a scan must not continue without its checkpoints.
+    artifacts = RunArtifacts(config if isinstance(config, dict) else {})
+    run = {"state": initial_state, "node": "pipeline", "artifacts": artifacts}
+    token = _active_run.set(run)
+    try:
+        with telemetry_session(max_llm_calls=50), ExitStack() as contexts:
+            initial_state["pipeline_status"] = "running"
+            artifacts.save(initial_state, node="pipeline", event="started")
+            try:
+                if not isinstance(config, dict):
+                    raise ValueError("config must be a mapping")
+                # A bad input follows the normal validate/report path, without
+                # constructing clients or entering runtime/network operations.
+                try:
+                    normalized_target, normalized_config = validate_pipeline_input(target_url, config)
+                except InputValidationError:
+                    normalized_config = None
+                if normalized_config is not None:
+                    initial_state.update(target_url=normalized_target, config=normalized_config, _input_validated=True)
+                    current_telemetry().max_llm_calls = normalized_config["max_llm_calls"]
+                    contexts.enter_context(runtime_session(normalized_config))
+                app = build_coordinator_graph()
+                # Each agent execution can be followed by a decision node.
+                # Leave room for validate/init/report/reflection so LangGraph's
+                # default 25 steps cannot pre-empt our explicit execution limit.
+                max_iterations = (normalized_config or {}).get("max_iterations", 20)
+                final_state = app.invoke(initial_state, config={"recursion_limit": 2 * max_iterations + 10})
+                run["state"] = final_state
+                sync_state(final_state)
+                final_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+                statuses = set(final_state.get("agent_statuses", {}).values())
+                required = set(_EXECUTION_NODES.values())
+                final_state["all_modules_executed"] = all(final_state.get("agent_attempts", {}).get(k, 0) > 0 for k in required)
+                final_state["all_modules_successful"] = all(final_state.get("agent_statuses", {}).get(k) == "success" for k in required)
+                final_state["pipeline_status"] = (
+                    "failed" if final_state.get("agent_statuses", {}).get("validate") == "failed"
+                    else "partial" if final_state.get("error_log") or final_state.get("stop_reason") or statuses & {"failed", "partial", "pending", "running"}
+                    else "completed"
+                )
+                public = artifacts.save(final_state, node="pipeline", event=final_state["pipeline_status"])
+                start_dt = datetime.fromisoformat(final_state["started_at"])
+                finish_dt = datetime.fromisoformat(final_state["finished_at"])
+                log_pipeline_summary(
+                    session_id=public.get("session_id", "unknown"), target_url=public.get("target_url", ""),
+                    duration_sec=max((finish_dt - start_dt).total_seconds(), 0.0),
+                    stats={
+                        "verified_results": len(public.get("verified_results", [])),
+                        "unverified_results": len(public.get("unverified_results", [])),
+                        "verification_status": public.get("verification_status", "not_checked"),
+                        "false_positives": len(public.get("false_positives", [])),
+                        "llm_calls": public.get("llm_call_count", 0),
+                        "http_requests": public.get("total_http_requests"),
+                        "decisions_made": len(public.get("decision_chain", [])),
+                        "agent_statuses": public.get("agent_statuses", {}),
+                    },
+                )
+                return public
+            except ArtifactWriteError:
+                # Do not mask a disk failure with another save or claim success.
+                raise
+            except BaseException as exc:
+                state = run["state"]
+                sync_state(state)
+                state["finished_at"] = datetime.now(timezone.utc).isoformat()
+                public = artifacts.record_failure(state, exc, node=run["node"])
+                if not isinstance(exc, Exception):
+                    raise
+                return public
+    finally:
+        _active_run.reset(token)

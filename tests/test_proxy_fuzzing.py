@@ -424,6 +424,24 @@ class ProxyCoordinatorProvenanceTests(unittest.TestCase):
             self.assertNotIn(secret, json.dumps(state["audit_log"]))
         self.assertEqual(operator_options, snapshot)
 
+    def test_manager_cannot_override_direct_route_with_fixed_proxy_or_tls_policy(self):
+        manager_options = {
+            "proxy": "http://manager:Secret_194@127.0.0.1:9000",
+            "auth_origins": ["http://outside-scope.invalid"],
+            "verify_ssl": False, "insecure": True, "tls_ca_file": "unapproved.pem",
+            "lab_source_ips": ["127.0.0.2"], "source_ip": "127.0.0.2",
+            "source_address": "127.0.0.2", "verify": False, "ssl_context": "unapproved",
+        }
+        state = self.state_for(manager_options, {"engine": "python_http"})
+        with patch.object(graph, "_get_decision_engine", return_value=SimpleNamespace(llm=None)), \
+             patch.object(FuzzingAgent, "execute", return_value=self.completed_measurement()) as execute:
+            graph.run_fuzzing(state)
+        self.assertEqual(execute.call_args.kwargs["engine"], "python_http")
+        for key in manager_options:
+            self.assertNotIn(key, execute.call_args.kwargs)
+            self.assertNotIn(key, state["audit_log"][0]["config_adjustments"])
+        self.assertNotIn("Secret_194", json.dumps(state["audit_log"]))
+
     def test_pipeline_returns_redacted_copies_and_preserves_operator_configuration(self):
         secret_url = "http://pipeline_user:PipelineSecret_820@127.0.0.1:9200"
         operator_config = {"fuzzing_options": {
@@ -433,7 +451,7 @@ class ProxyCoordinatorProvenanceTests(unittest.TestCase):
         snapshot = copy.deepcopy(operator_config)
         internal_state = {}
 
-        def invoke(initial_state):
+        def invoke(initial_state, config=None):
             internal_state.update(initial_state)
             internal_state.update(
                 started_at="2026-10-20T00:00:00+00:00", finished_at="2026-10-20T00:00:01+00:00",
@@ -446,7 +464,8 @@ class ProxyCoordinatorProvenanceTests(unittest.TestCase):
             with patch.object(graph, "log_pipeline_summary"):
                 public_state = graph.run_pipeline("http://127.0.0.1:8765", operator_config)
         self.assertEqual(operator_config, snapshot)
-        self.assertEqual(internal_state["config"], snapshot)
+        self.assertEqual(internal_state["config"]["fuzzing_options"], snapshot["fuzzing_options"])
+        self.assertEqual(internal_state["config"]["pipeline_timeout_seconds"], 600)
         self.assertEqual(internal_state["_config_adjustments"]["proxy_profiles"][0]["url"], secret_url)
         self.assertIsNot(public_state, internal_state)
         self.assertIsNot(public_state["config"], internal_state["config"])

@@ -19,6 +19,8 @@ from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from src.tools.http_fuzzing import _integer, _number, _prepare_urls, _SPOOF_HEADERS
+from src.coordinator.telemetry import record_http_attempt
+from src.coordinator.runtime import cap_http_timeout
 
 
 _DISALLOWED_OPTIONS = {
@@ -193,8 +195,9 @@ def run_loopback_rotation_lab(target_url: str, wordlist: Iterable[str], **option
         try:
             connection_type = HTTPSConnection if parts.scheme == "https" else HTTPConnection
             connection = connection_type(destination, port,
-                                         timeout=min(timeout, max(0.001, deadline - time.perf_counter())),
+                                         timeout=cap_http_timeout(min(timeout, max(0.001, deadline - time.perf_counter()))),
                                          source_address=(selected_source, 0))
+            record_http_attempt(kind="target")
             connection.connect()
             # The value comes from the live OS socket, never a header or assumption.
             record["bound_source_ip"] = connection.sock.getsockname()[0]
@@ -202,7 +205,7 @@ def run_loopback_rotation_lab(target_url: str, wordlist: Iterable[str], **option
                 raise OSError("The operating system did not bind the selected loopback source")
             if time.perf_counter() >= deadline:
                 raise TimeoutError("Run duration limit reached before sending the request")
-            connection.sock.settimeout(min(timeout, max(0.001, deadline - time.perf_counter())))
+            connection.sock.settimeout(cap_http_timeout(min(timeout, max(0.001, deadline - time.perf_counter()))))
             request_body = body.replace("FUZZ", word).encode("utf-8") if isinstance(body, str) else body
             path_and_query = urlunsplit(("", "", parts.path or "/", parts.query, ""))
             connection.request(method, path_and_query, body=request_body, headers=headers)
@@ -235,7 +238,7 @@ def run_loopback_rotation_lab(target_url: str, wordlist: Iterable[str], **option
                 if remaining <= 0:
                     raise TimeoutError("Run duration limit reached while reading the response")
                 if response_socket is not None:
-                    response_socket.settimeout(min(timeout, remaining))
+                    response_socket.settimeout(cap_http_timeout(min(timeout, remaining)))
                 try:
                     chunk = response.read1(min(65536, body_cap - record["content_length"]))
                 except IncompleteRead as exc:

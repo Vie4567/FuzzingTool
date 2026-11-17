@@ -25,16 +25,17 @@ class Soft404IntegrityTests(unittest.TestCase):
         original = deepcopy(records)
         agent = Soft404FilterAgent()
 
-        first = agent.execute("https://example.invalid", records)
-        second = agent.execute("https://example.invalid", records)
+        first = agent.execute("https://example.invalid", records, enabled=False)
+        second = agent.execute("https://example.invalid", records, enabled=False)
 
-        self.assertEqual(first, second)
+        self.assertEqual(first["unverified"], second["unverified"])
         self.assertEqual(records, original)
         self.assertEqual(first["verified"], [])
         self.assertEqual(first["false_positives"], [])
-        self.assertIsNone(first["baseline"])
+        self.assertFalse((first.get("baseline") or {}).get("groups"))
         self.assertFalse(first["verification_performed"])
-        self.assertEqual(first["verification_status"], "not_implemented")
+        self.assertEqual(first["verification_status"], "skipped")
+        self.assertEqual(first["stats"]["total_requests"], 0)
         self.assertEqual(len(first["unverified"]), len(records))
         for source, preserved in zip(records, first["unverified"]):
             self.assertIsNot(source, preserved)
@@ -44,23 +45,23 @@ class Soft404IntegrityTests(unittest.TestCase):
             self.assertEqual(preserved["verification"], "not_checked")
             self.assertFalse(preserved["verification_performed"])
             self.assertNotIn("similarity_to_baseline", preserved)
-        first["unverified"][0]["headers"]["Content-Type"] = "changed"
+        first["unverified"][0]["headers"] = {"Content-Type": "changed"}
         self.assertEqual(records, original)
 
-    def test_no_llm_or_tool_execution_and_skip_is_logged(self):
+    def test_empty_input_does_not_use_llm_or_tool_execution(self):
         agent = Soft404FilterAgent(llm=Mock())
         with (
             patch.object(agent, "plan_tool_execution") as plan,
             patch.object(agent, "generate_justification") as explain,
             patch.object(agent.tool_registry, "execute_tool") as execute_tool,
-            patch("src.agents.soft404_filter.log_agent_skip") as log_skip,
+            patch("src.agents.soft404_filter.log_agent_success") as log_result,
         ):
             result = agent.execute("https://example.invalid", [])
         plan.assert_not_called()
         explain.assert_not_called()
         execute_tool.assert_not_called()
         agent.llm.invoke.assert_not_called()
-        log_skip.assert_called_once()
+        log_result.assert_called_once()
         self.assertEqual(result["tools_executed"], [])
         self.assertEqual(result["unverified"], [])
         self.assertIn("baseline", result["subagent_justification"])
@@ -70,7 +71,7 @@ class Soft404IntegrityTests(unittest.TestCase):
                     "response_time": 0.03, "verification": "genuine",
                     "verification_performed": True, "similarity_to_baseline": 0.13}]
         original = deepcopy(records)
-        result = Soft404FilterAgent().execute("https://example.invalid", records)
+        result = Soft404FilterAgent().execute("https://example.invalid", records, enabled=False)
         row = result["unverified"][0]
         self.assertEqual(row["verification"], "not_checked")
         self.assertFalse(row["verification_performed"])

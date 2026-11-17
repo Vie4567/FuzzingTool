@@ -43,7 +43,7 @@ class EndpointAssembler:
         endpoints = assembler.assemble(dev_profile, max_endpoints=2000)
     """
 
-    KNOWLEDGE_FILE = Path("knowledge/api_url_patterns.json")
+    KNOWLEDGE_FILE = Path(__file__).resolve().parents[2] / "knowledge/api_url_patterns.json"
 
     def __init__(self):
         self._knowledge: Dict[str, Any] = self._load_knowledge()

@@ -1,43 +1,37 @@
-"""
-Authentication Manager Module.
-Hỗ trợ 2 chế độ xác thực cho Recon và Fuzzing:
-- Cách 2: Cung cấp sẵn Cookie hoặc Bearer Token (Manual Session / Token).
-- Cách 3: Tự động đăng nhập qua Account credentials (username, password, optional login_url).
-- Mặc định: Không truyền gì -> Black-box testing (Unauthenticated).
-"""
+"""Origin-bound authentication for Recon using its verified, scoped transport."""
 
-import urllib.request
-import urllib.parse
-import ssl
-import re
 import http.cookiejar
+import json
 import logging
-from typing import Optional, Dict, Any, Tuple
+import re
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Optional, Dict, Tuple
+
+from src.coordinator.llm_logging import sanitize_for_log
+from src.tools.recon_http import ScopedReconTransport
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Common login path candidates when login_url is not specified
+_DEFAULT_UA = "SentinelPentest/1.0 (scoped-recon-auth)"
 COMMON_LOGIN_PATHS = [
-    "/login",
-    "/admin",
-    "/administrator",
-    "/signin",
-    "/user/login",
-    "/auth/login",
-    "/wp-login.php",
-    "/index.php?option=com_users&view=login",
+    "/login", "/admin", "/administrator", "/signin", "/user/login",
+    "/auth/login", "/wp-login.php", "/index.php?option=com_users&view=login",
 ]
 
 
+def _origin_key(url):
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme.lower(), parsed.hostname.lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
 class AuthManager:
-    """
-    Quản lý ngữ cảnh xác thực (Authentication Context).
+    """Resolve credentials for one target origin; never log credential values.
+
+    A manager is bound on the first get_auth_headers(base_url) call. Reusing it
+    for a different origin is rejected, even when that origin is network-allowed.
+    A new manager is required for a different target session.
     """
 
     def __init__(
@@ -47,256 +41,214 @@ class AuthManager:
         account: Optional[Dict[str, str]] = None,
         custom_headers: Optional[Dict[str, str]] = None,
         timeout: int = 10,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
+        allowed_origins=None,
+        auth_origins=None,
+        tls_ca_file=None,
     ):
-        """
-        Args:
-            cookie: Chuỗi Cookie đã đăng nhập (VD: 'PHPSESSID=...; token=...')
-            bearer_token: JWT / Bearer Token
-            account: Dict chứa {"username": "...", "password": "...", "login_url": "..."}
-            custom_headers: Các header tùy chỉnh khác
-            timeout: Timeout cho HTTP request
-            verify_ssl: Bật/tắt kiểm tra chứng chỉ SSL
-        """
-        # Chuẩn hóa nếu người dùng truyền nhầm Token vào trường Cookie
-        # VD: --cookie "Authorization=Bearer eyJ..." hoặc --cookie "Bearer eyJ..." hoặc --cookie "eyJ..."
+        if verify_ssl is not True:
+            raise ValueError("Authentication requires TLS certificate verification; use tls_ca_file for a private CA")
+        if cookie is not None and not isinstance(cookie, str):
+            raise ValueError("cookie must be a string")
+        if bearer_token is not None and not isinstance(bearer_token, str):
+            raise ValueError("bearer_token must be a string")
+        if custom_headers is not None and not isinstance(custom_headers, dict):
+            raise ValueError("custom_headers must be a dictionary")
+        if account is not None and (
+            not isinstance(account, dict)
+            or not all(isinstance(account.get(key), str) and account[key] for key in ("username", "password"))
+        ):
+            raise ValueError("account requires nonempty username and password strings")
         cleaned_cookie = cookie.strip() if cookie else None
         detected_token = bearer_token.strip() if bearer_token else None
-
         if cleaned_cookie and not detected_token:
             if "bearer " in cleaned_cookie.lower():
-                m = re.search(r'bearer\s+([a-zA-Z0-9_\-\.]+)', cleaned_cookie, re.I)
-                if m:
-                    detected_token = m.group(1)
-                    cleaned_cookie = None
+                match = re.search(r"bearer\s+([a-zA-Z0-9_\-\.]+)", cleaned_cookie, re.I)
+                if match:
+                    detected_token, cleaned_cookie = match.group(1), None
             elif cleaned_cookie.startswith("eyJ"):
-                detected_token = cleaned_cookie
-                cleaned_cookie = None
-
+                detected_token, cleaned_cookie = cleaned_cookie, None
         self.cookie = cleaned_cookie
         self.bearer_token = detected_token
-        self.account = account if (account and account.get("username") and account.get("password")) else None
-        self.custom_headers = custom_headers or {}
+        self.account = dict(account) if account is not None else None
+        self.custom_headers = dict(custom_headers or {})
         self.timeout = timeout
-        self.verify_ssl = verify_ssl
-
-        # SSL context
-        self.ssl_ctx = ssl.create_default_context()
-        if not verify_ssl:
-            self.ssl_ctx.check_hostname = False
-            self.ssl_ctx.verify_mode = ssl.CERT_NONE
-
-        # Cookie jar for auto-login
+        self.verify_ssl = True
+        self.tls_ca_file = tls_ca_file
+        self.allowed_origins = allowed_origins
+        self.auth_origins = auth_origins
+        self.ssl_ctx = ssl.create_default_context(cafile=tls_ca_file)
         self.cookie_jar = http.cookiejar.CookieJar()
-        self._cached_auth_headers: Optional[Dict[str, str]] = None
+        self._cached_auth_headers = None
+        self._transport = None
+        self._bound_origin = None
+        self._base_url = None
 
-    def get_auth_headers(self, base_url: str = "") -> Dict[str, str]:
-        """
-        Lấy các header xác thực đã giải quyết:
-        1. Ưu tiên Cách 2: Nếu có cookie hoặc bearer_token -> trả về ngay.
-        2. Nếu không có nhưng có account -> thực hiện Cách 3: Auto-login.
-        3. Mặc định: Trả về {} (không xác thực).
-        """
-        if self._cached_auth_headers is not None:
-            return dict(self._cached_auth_headers)
-
+    def _supplied_headers(self):
         headers = dict(self.custom_headers)
-
-        # ── Cách 2: Cung cấp Cookie hoặc Bearer Token trực tiếp ──────────────
-        if self.cookie or self.bearer_token:
-            if self.cookie:
-                headers["Cookie"] = self.cookie
-                logger.info(f"[AuthManager] Sử dụng Cookie thủ công: {self.cookie[:30]}...")
-            if self.bearer_token:
-                headers["Authorization"] = f"Bearer {self.bearer_token}"
-                logger.info(f"[AuthManager] Sử dụng Bearer Token: {self.bearer_token[:20]}...")
-            self._cached_auth_headers = headers
-            return headers
-
-        # ── Cách 3: Tự động Login từ Account credentials ──────────────────────
-        if self.account:
-            login_headers = self._auto_login(base_url)
-            headers.update(login_headers)
-            self._cached_auth_headers = headers
-            return headers
-
-        # ── Mặc định: Không truyền gì (Black-box unauthenticated) ─────────────
-        self._cached_auth_headers = headers
+        for key, value in (("Cookie", self.cookie),
+                           ("Authorization", "Bearer " + self.bearer_token if self.bearer_token else None)):
+            if value:
+                headers = {name: item for name, item in headers.items() if name.lower() != key.lower()}
+                headers[key] = value
         return headers
 
-    def _auto_login(self, base_url: str) -> Dict[str, str]:
-        """
-        Thực hiện quy trình đăng nhập tự động:
-        1. Xác định Login URL (từ account hoặc tự động dò tìm form đăng nhập).
-        2. Gửi GET để thu thập cookie ban đầu và bóc tách form fields (CSRF token, v.v.).
-        3. Điền username, password và submit POST.
-        4. Trích xuất Session Cookie thu được.
-        """
-        username = self.account.get("username", "")
-        password = self.account.get("password", "")
-        specified_login_url = self.account.get("login_url", "")
+    def redact(self, value):
+        """Mask caller and resolved credentials without attempting a login."""
+        return sanitize_for_log({
+            "headers": {**self._supplied_headers(), **(self._cached_auth_headers or {})},
+            "credentials": self.account,
+            "payload": value,
+        })["payload"]
 
-        target_login_url = None
-        base_clean = base_url.rstrip("/")
-
-        if specified_login_url:
-            if specified_login_url.startswith("http"):
-                target_login_url = specified_login_url
-            else:
-                target_login_url = f"{base_clean}/{specified_login_url.lstrip('/')}"
+    def _bind(self, base_url):
+        if not base_url:
+            if self._base_url is None:
+                raise ValueError("base_url is required to scope authentication")
+            base_url = self._base_url
+        if self._transport is None:
+            transport = ScopedReconTransport(
+                base_url, headers=self._supplied_headers(),
+                allowed_origins=self.allowed_origins, auth_origins=self.auth_origins,
+                verify_ssl=True, tls_ca_file=self.tls_ca_file,
+            )
+            transport.check_url(base_url, credentials=bool(self._supplied_headers() or self.account))
+            self._transport = transport
+            self._base_url = base_url
+            self._bound_origin = _origin_key(base_url)
+            self.ssl_ctx = transport.ssl_context
         else:
-            # Tự động tìm form login trên trang chủ hoặc các path phổ biến
-            target_login_url = self._find_login_url(base_clean)
+            self._transport.check_url(base_url)
+            if _origin_key(base_url) != self._bound_origin:
+                raise ValueError("Authentication manager is bound to a different target origin")
+        return self._transport
 
-        if not target_login_url:
-            logger.warning("[AuthManager] Không tìm thấy URL đăng nhập phù hợp.")
+    def get_auth_headers(self, base_url: str = "") -> Dict[str, str]:
+        """Return copies of scoped headers; failed account login is explicit."""
+        if not base_url and self._transport is None and not (self._supplied_headers() or self.account):
             return {}
+        self._bind(base_url)
+        if self._cached_auth_headers is not None:
+            return dict(self._cached_auth_headers)
+        headers = self._supplied_headers()
+        if self.cookie or self.bearer_token:
+            logger.info("[AuthManager] Using caller-supplied authentication headers")
+        elif self.account:
+            resolved = self._auto_login(self._base_url)
+            if not resolved:
+                raise RuntimeError("Automatic login did not produce scoped authentication credentials")
+            headers.update(resolved)
+        self._cached_auth_headers = dict(headers)
+        return dict(headers)
 
-        logger.info(f"[AuthManager] Đang thực hiện Auto-Login vào: {target_login_url} (User: {username})")
+    def _open(self, url, *, method="GET", data=None, headers=None, timeout=None):
+        # Auth discovery, login forms and submission all remain inside credential
+        # scope, which may be stricter than the network scope used by Recon.
+        self._transport.check_url(url, credentials=True)
+        request = urllib.request.Request(url, data=data, method=method,
+                                         headers={"User-Agent": _DEFAULT_UA, **(headers or {})})
+        return self._transport.open(request, timeout=self.timeout if timeout is None else timeout,
+                                    cookie_jar=self.cookie_jar)
 
-        # Cookie processor & opener
-        cookie_handler = urllib.request.HTTPCookieProcessor(self.cookie_jar)
-        opener = urllib.request.build_opener(
-            cookie_handler,
-            urllib.request.HTTPSHandler(context=self.ssl_ctx)
-        )
-
+    def _auto_login(self, base_url: str) -> Dict[str, str]:
+        self._bind(base_url)
+        username, password = self.account["username"], self.account["password"]
+        specified = self.account.get("login_url", "")
         try:
-            # Bước 1: GET trang đăng nhập để lấy cookies ban đầu & bóc tách form
-            req_get = urllib.request.Request(
-                target_login_url,
-                headers={"User-Agent": _DEFAULT_UA}
-            )
-            with opener.open(req_get, timeout=self.timeout) as resp:
-                get_body = resp.read().decode("utf-8", errors="ignore")
-                final_get_url = resp.geturl()
-
-            form_data, post_action = self._extract_login_form(get_body, final_get_url, username, password)
-            if not form_data:
-                logger.warning("[AuthManager] Không trích xuất được form đăng nhập.")
+            target = urllib.parse.urljoin(base_url.rstrip("/") + "/", specified) if specified else self._find_login_url(base_url)
+            if not target:
                 return {}
-
-            # Bước 2: POST credentials
-            encoded_data = urllib.parse.urlencode(form_data).encode("utf-8")
-            req_post = urllib.request.Request(
-                post_action,
-                data=encoded_data,
-                headers={
-                    "User-Agent": _DEFAULT_UA,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": target_login_url,
-                }
-            )
-
-            # Đọc body phản hồi
-            post_body = post_resp.read().decode("utf-8", errors="ignore")
-            auth_res = {}
-
-            # Kiểm tra xem phản hồi có trả về JSON Token không (API JWT / OAuth)
+            with self._open(target) as response:
+                page = response.read().decode("utf-8", errors="ignore")
+                page_url = response.geturl()
+            data, action = self._extract_login_form(page, page_url, username, password)
+            if not data:
+                logger.warning("[AuthManager] No usable login form found")
+                return {}
+            with self._open(action, method="POST", data=urllib.parse.urlencode(data).encode("utf-8"),
+                            headers={"Content-Type": "application/x-www-form-urlencoded"}) as response:
+                body = response.read().decode("utf-8", errors="ignore")
+            result = {}
             try:
-                res_json = json.loads(post_body)
-                token = (
-                    res_json.get("token") or
-                    res_json.get("access_token") or
-                    res_json.get("jwt") or
-                    res_json.get("accessToken") or
-                    res_json.get("id_token") or
-                    (res_json.get("data") and isinstance(res_json["data"], dict) and res_json["data"].get("token"))
-                )
-                if token:
-                    logger.info(f"[AuthManager] ✅ Auto-Login thành công qua API! Thu được Bearer Token: {token[:20]}...")
-                    auth_res["Authorization"] = f"Bearer {token}"
-            except Exception:
-                pass
-
-            # Bước 3: Lấy chuỗi Cookie đã lưu trong CookieJar
-            # Lọc phân biệt giữa Session Cookies thực sự và Tracking Cookies (_ga, g_state, _fbp, ...)
-            TRACKING_COOKIE_PREFIXES = ("_ga", "_gid", "_gat", "_fbp", "__utm", "g_state", "ajs_")
-            session_cookies = []
-            all_cookies = []
-
-            for cookie in self.cookie_jar:
-                cookie_pair = f"{cookie.name}={cookie.value}"
-                all_cookies.append(cookie_pair)
-                # Kiểm tra xem có phải cookie phiên thực sự không
-                if not any(cookie.name.startswith(pfx) for pfx in TRACKING_COOKIE_PREFIXES):
-                    session_cookies.append(cookie_pair)
-
-            if session_cookies:
-                cookie_str = "; ".join(session_cookies)
-                logger.info(f"[AuthManager] ✅ Auto-Login thành công! Thu được Session Cookie phiên: {cookie_str[:40]}...")
-                auth_res["Cookie"] = "; ".join(all_cookies)
-            elif all_cookies:
-                logger.warning(
-                    "[AuthManager] ⚠️ Chỉ phát hiện Tracking/SSO Cookies (_ga, g_state...), không tìm thấy Session Cookie phiên. "
-                    "Hệ thống đích có thể lưu Token trong LocalStorage (JWT). Hãy truyền trực tiếp qua --token."
-                )
-                auth_res["Cookie"] = "; ".join(all_cookies)
-
-            if auth_res:
-                return auth_res
+                parsed = json.loads(body)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                token = next((parsed.get(key) for key in ("token", "access_token", "jwt", "accessToken", "id_token")
+                              if isinstance(parsed.get(key), str) and parsed[key]), None)
+                if token is None and isinstance(parsed.get("data"), dict):
+                    token = parsed["data"].get("token")
+                if isinstance(token, str) and token:
+                    result["Authorization"] = "Bearer " + token
+            # Apply CookieJar's domain/path/Secure rules to the bound target,
+            # rather than copying every cookie collected from a login origin.
+            cookie_request = urllib.request.Request(self._base_url)
+            self.cookie_jar.add_cookie_header(cookie_request)
+            cookie_value = cookie_request.get_header("Cookie")
+            if cookie_value:
+                names = [piece.split("=", 1)[0].strip() for piece in cookie_value.split(";")]
+                tracking = ("_ga", "_gid", "_gat", "_fbp", "__utm", "g_state", "ajs_")
+                if any(not name.startswith(tracking) for name in names):
+                    result["Cookie"] = cookie_value
+            if result:
+                logger.info("[AuthManager] Received scoped authentication credentials")
             else:
-                logger.warning("[AuthManager] Đã gửi thông tin login nhưng không nhận được Set-Cookie hay Token.")
-                return {}
-
-        except Exception as e:
-            logger.error(f"[AuthManager] Lỗi khi thực hiện Auto-Login: {e}")
+                logger.warning("[AuthManager] Login response contained no usable authentication credentials")
+            return result
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            logger.warning("[AuthManager] Login stopped on HTTP response %s", exc.code)
+            return {}
+        except Exception as exc:
+            # Server messages/URLs may echo credentials; report only the type.
+            logger.warning("[AuthManager] Login failed (%s)", type(exc).__name__)
             return {}
 
-    def _find_login_url(self, base_clean: str) -> Optional[str]:
-        """Dò tìm URL đăng nhập từ trang chủ, router hoặc HTTP redirect."""
-        # 1. Thử quét trang chủ xem có form password hoặc link login không
+    def _find_login_url(self, base_url: str) -> Optional[str]:
+        """Discover only inside credential scope, never follow redirects."""
         try:
-            req = urllib.request.Request(base_clean, headers={"User-Agent": _DEFAULT_UA})
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_ctx) as r:
-                home_body = r.read().decode("utf-8", errors="ignore")
-                if 'type="password"' in home_body.lower() or "type='password'" in home_body.lower():
-                    return base_clean
-                # Tìm thẻ a có href chứa login / signin / auth
-                for m in re.finditer(r'href=[\"\']([^\"\']*(?:login|signin|dang-nhap|auth)[^\"\']*)[\"\']', home_body, re.I):
-                    candidate = m.group(1)
-                    return urllib.parse.urljoin(base_clean, candidate)
-                # Tìm trong router JS bundle (cho SPA như React/Vue/Angular)
-                for js_path in re.findall(r'<script[^>]+src=[\"\']([^\"\']+)[\"\']', home_body, re.I):
-                    js_url = urllib.parse.urljoin(base_clean, js_path)
-                    try:
-                        req_js = urllib.request.Request(js_url, headers={"User-Agent": _DEFAULT_UA})
-                        with urllib.request.urlopen(req_js, timeout=4, context=self.ssl_ctx) as js_r:
-                            js_content = js_r.read().decode("utf-8", errors="ignore")
-                            for route in re.findall(r'[\"\'](/(?:login|signin|auth)[a-zA-Z0-9_\-]*)[\"\']', js_content):
-                                return urllib.parse.urljoin(base_clean, route)
-                    except Exception:
-                        pass
+            with self._open(base_url) as response:
+                body = response.read().decode("utf-8", errors="ignore")
+            if re.search(r"type=[\"']password[\"']", body, re.I):
+                return base_url
+            links = re.findall(r"href=[\"']([^\"']*(?:login|signin|dang-nhap|auth)[^\"']*)[\"']", body, re.I)
+            for link in links:
+                candidate = urllib.parse.urljoin(base_url, link)
+                if self._transport.allows_auth(candidate):
+                    return candidate
+            scripts = re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", body, re.I)
+            for path in scripts:
+                url = urllib.parse.urljoin(base_url, path)
+                if not self._transport.allows_auth(url):
+                    continue
+                try:
+                    with self._open(url, timeout=min(4, self.timeout)) as response:
+                        script = response.read().decode("utf-8", errors="ignore")
+                    routes = re.findall(r"[\"'](/(?:login|signin|auth)[a-zA-Z0-9_\-]*)[\"']", script)
+                    if routes:
+                        return urllib.parse.urljoin(base_url, routes[0])
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                except Exception:
+                    pass
+        except urllib.error.HTTPError as exc:
+            exc.close()
         except Exception:
             pass
-
-        # 2. Thử truy cập trang bảo vệ như /admin để bắt Redirect Location
-        try:
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
-            no_redir_opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=self.ssl_ctx))
-            resp = no_redir_opener.open(f"{base_clean}/admin", timeout=4)
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                loc = e.headers.get("Location")
-                if loc:
-                    return urllib.parse.urljoin(base_clean, loc)
-        except Exception:
-            pass
-
-        # 3. Thử lần lượt các URL phổ biến
         for path in COMMON_LOGIN_PATHS:
-            cand_url = f"{base_clean}{path}"
+            candidate = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
             try:
-                req = urllib.request.Request(cand_url, headers={"User-Agent": _DEFAULT_UA})
-                with urllib.request.urlopen(req, timeout=4, context=self.ssl_ctx) as r:
-                    if r.status in (200, 301, 302):
-                        return cand_url
+                with self._open(candidate, timeout=min(4, self.timeout)) as response:
+                    body = response.read().decode("utf-8", errors="ignore")
+                    if re.search(r"type=[\"']password[\"']", body, re.I):
+                        return candidate
+            except urllib.error.HTTPError as exc:
+                # A redirect is only recorded. Its destination is never fetched
+                # implicitly, including HTTP->HTTPS or SSO/login redirects.
+                exc.close()
             except Exception:
                 continue
-
-        return f"{base_clean}/login"
+        return None
 
     def _extract_login_form(
         self, html: str, page_url: str, username: str, password: str

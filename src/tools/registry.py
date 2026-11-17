@@ -96,65 +96,68 @@ default_registry = ToolRegistry()
 # ĐĂNG KÝ CÁC CÔNG CỤ CHUYÊN DỤNG (RECON, WORDLIST, FUZZ, PARAM, FILTER)
 # ═══════════════════════════════════════════════════════════════
 
-def _wrap_ch1(target_url: str, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    # Chạy channel 1 qua execute hoặc internal fetch
-    status, headers, body = agent._fetch_sync(target_url, timeout=timeout)
-    fp_data = agent._load_json(agent._FINGERPRINTS_FILE)
-    waf_data = agent._load_json(agent._WAF_SIGS_FILE)
-    ch1_res = agent._ch1_header_fingerprint(headers, body, fp_data, waf_data)
-    return {"status_code": status, "ch1_header_fingerprint": ch1_res}
+def _recon_context(target_url, options):
+    from src.agents import tech_recon as recon
+    from src.tools.recon_http import recon_options_from_config
+    agent = recon.TechReconAgent(**recon_options_from_config(options))
+    agent._load_knowledge()
+    return recon, agent, agent._build_transport(target_url)
 
-def _wrap_ch2(target_url: str, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    status, headers, body = agent._fetch_sync(target_url, timeout=timeout)
-    fp_data = agent._load_json(agent._FINGERPRINTS_FILE)
-    ch2_res = agent._ch2_dom_parser(body, target_url, fp_data)
-    return {"ch2_dom_parser": ch2_res}
 
-def _wrap_ch3(target_url: str, js_script_paths: list = None, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    ch3_res = agent._ch3_js_bundle_analyzer(target_url, js_script_paths or [], timeout=timeout)
-    return {"ch3_js_bundle_analyzer": ch3_res}
+def _wrap_ch1(target_url: str, timeout: int = 10, **options) -> dict:
+    recon, agent, transport = _recon_context(target_url, options)
+    status, headers, body = transport.fetch(target_url, timeout=timeout)
+    result = recon._ch1_header_fingerprint(headers, body, agent._fp_data, agent._waf_data)
+    return agent._redact({"status_code": status, "ch1_header_fingerprint": result}, transport)
 
-def _wrap_ch4(target_url: str, max_depth: int = 2, max_pages: int = 50) -> dict:
+def _wrap_ch2(target_url: str, timeout: int = 10, **options) -> dict:
+    recon, agent, transport = _recon_context(target_url, options)
+    _, _, body = transport.fetch(target_url, timeout=timeout)
+    return agent._redact({"ch2_dom_parser": recon._ch2_dom_parse(body, target_url, agent._fp_data)}, transport)
+
+def _wrap_ch3(target_url: str, js_script_paths: list = None, timeout: int = 10, **options) -> dict:
+    from urllib.parse import urljoin, urlsplit
+    recon, agent, transport = _recon_context(target_url, options)
+    result = {"paths": [], "params": [], "api_origins": []}
+    for path in (js_script_paths or [])[:20]:
+        status, _, body = transport.fetch(urljoin(target_url, path), timeout=timeout)
+        if status == 200:
+            parsed = recon._ch3_js_analyze(body, agent._js_patterns, base_url=target_url,
+                                           source_url=urljoin(target_url, path))
+            for key in result:
+                result[key] = sorted(set(result[key]).union(parsed.get(key, [])))
+    return agent._redact({"ch3_js_bundle_analyzer": result}, transport)
+
+def _wrap_ch4(target_url: str, max_depth: int = 2, max_pages: int = 50, **options) -> dict:
     import asyncio
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    spider_cfg = agent._load_json(agent._SPIDER_CFG_FILE)
-    if max_depth:
-        spider_cfg["max_depth"] = max_depth
-    if max_pages:
-        spider_cfg["max_pages"] = max_pages
-    ch4_res = asyncio.run(agent._ch4_spider_crawl(target_url, spider_cfg))
-    return {"ch4_spider_crawl": ch4_res}
+    from copy import deepcopy
+    recon, agent, transport = _recon_context(target_url, options)
+    spider_cfg = deepcopy(agent._spider_cfg)
+    spider_cfg.setdefault("limits", {}).update(default_max_depth=max_depth, default_max_pages=max_pages)
+    spider = recon._ReconSpider(target_url, {}, spider_cfg, transport=transport)
+    return agent._redact({"ch4_spider_crawl": asyncio.run(spider.run())}, transport)
 
-def _wrap_ch5(target_url: str, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    sens_data = agent._load_json(agent._SENSITIVE_FILES)
-    ch5_res = agent._ch5_security_files_probe(target_url, sens_data, timeout=timeout)
-    return {"ch5_security_files_probe": ch5_res}
+def _wrap_ch5(target_url: str, timeout: int = 10, **options) -> dict:
+    import asyncio
+    recon, agent, transport = _recon_context(target_url, options)
+    return agent._redact({"ch5_security_files_probe": asyncio.run(recon._ch5_probe(target_url, transport=transport))}, transport)
 
-def _wrap_ch6(target_url: str, discovered_paths: list = None, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    ch6_res = agent._ch6_api_schema_detect(target_url, discovered_paths or [], timeout=timeout)
-    return {"ch6_api_schema_detect": ch6_res}
+def _wrap_ch6(target_url: str, discovered_paths: list = None, timeout: int = 10, **options) -> dict:
+    import asyncio
+    from urllib.parse import urljoin
+    recon, agent, transport = _recon_context(target_url, options)
+    urls = [urljoin(target_url, path) for path in (discovered_paths or [])]
+    return agent._redact({"ch6_api_schema_detect": asyncio.run(recon._ch6_api_schema(urls, transport=transport))}, transport)
 
-def _wrap_ch7(target_url: str, timeout: int = 10) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    ch7_res = agent._ch7_error_probe(target_url, timeout=timeout)
-    return {"ch7_error_probe": ch7_res}
+def _wrap_ch7(target_url: str, timeout: int = 10, **options) -> dict:
+    import asyncio
+    recon, agent, transport = _recon_context(target_url, options)
+    return agent._redact({"ch7_error_probe": asyncio.run(recon._ch7_error_probe(target_url, transport=transport))}, transport)
 
-def _wrap_full_recon(target_url: str) -> dict:
-    from src.agents.tech_recon import TechReconAgent
-    agent = TechReconAgent()
-    return agent._run_full_recon_internal(target_url)
+def _wrap_full_recon(target_url: str, **options) -> dict:
+    import asyncio
+    _, agent, transport = _recon_context(target_url, options)
+    return asyncio.run(agent._run_async(target_url, transport=transport))
 
 
 def _wrap_wordlist_gen(tech_stack: dict, discovered_paths: list, js_endpoints: list = None) -> dict:
@@ -172,10 +175,10 @@ def _wrap_param_disc(target_url: str, discovered_paths: list) -> dict:
     agent = ParamDiscoveryAgent()
     return agent._run_param_discovery_internal(target_url, discovered_paths)
 
-def _wrap_soft404_filter(raw_results: list, target_url: str) -> dict:
+def _wrap_soft404_filter(raw_results: list, target_url: str, **options) -> dict:
     from src.agents.soft404_filter import Soft404FilterAgent
     agent = Soft404FilterAgent()
-    return agent._run_soft404_filter_internal(raw_results, target_url)
+    return agent._run_soft404_filter_internal(raw_results, target_url, **options)
 
 
 # Register Recon Tools

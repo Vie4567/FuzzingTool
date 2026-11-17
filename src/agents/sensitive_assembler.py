@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 class SensitiveFilesAssembler:
     """Engine lắp ráp và làm giàu danh sách Sensitive & Backup Files theo từng thành phần (Component-by-Component)."""
 
-    KNOWLEDGE_FILE = Path("knowledge/sensitive_files.json")
+    KNOWLEDGE_FILE = Path(__file__).resolve().parents[2] / "knowledge/sensitive_files.json"
 
     ARCHIVE_EXTENSIONS = [
         ".zip", ".tar.gz", ".sql", ".sql.gz", ".tar", ".bak", ".old", ".dump", ".7z", ".rar"

@@ -38,6 +38,10 @@ Sau khi mỗi Agent hoàn thành (hoặc thất bại), bạn phải:
 5. Nếu confidence < 0.6, PHẢI giải thích tại sao không chắc chắn
 6. KHÔNG BAO GIỜ loop vô hạn — mỗi agent tối đa retry 3 lần
 7. Nếu guard rail (circuit breaker, LLM quota) can thiệp, TUÂN THỦ ngay
+8. Generated khác selected; selected khác planned/attempted; attempted khác responses_received.
+   Đây là các giai đoạn và phạm vi đo khác nhau, không phải bằng chứng SharedState bị hỏng.
+   null là chưa biết, không phải 0. HTTP 200 chưa phải endpoint đã xác minh.
+   Timeout đơn thuần không chứng minh WAF hoặc IP bị chặn.
 
 ## OUTPUT FORMAT
 Trả lời CHÍNH XÁC theo JSON schema được yêu cầu. KHÔNG thêm text ngoài JSON."""
@@ -66,6 +70,7 @@ DECISION_PROMPT_TEMPLATE = """## TRẠNG THÁI HIỆN TẠI
 - Param results: {param_results_count}
 - Verified results: {verified_results_count}
 - Errors: {error_count}
+- Lifecycle đo được: {lifecycle_summary}
 
 ### Tài nguyên:
 - LLM calls: {llm_calls_used}/{llm_calls_max} (còn {llm_calls_remaining})
@@ -187,18 +192,26 @@ POST_SESSION_REFLECTION_PROMPT = """Phiên quét vừa hoàn thành. Hãy rút r
 - Agents executed: {agents_list}
 - Agents skipped: {skipped_list}
 - Results: {verified_count} verified, {false_positive_count} filtered
+- Lifecycle đo được: {lifecycle_summary}
+
+### Các fact có thể đối chiếu bằng logic xác định:
+{observed_facts}
 
 ### Chuỗi quyết định đã thực hiện:
 {decision_chain_summary}
 
 ### YÊU CẦU
+Chỉ đề xuất quan sát phiên này với evidence gồm fact và value khớp chính xác
+danh mục trên (giữ nguyên kiểu dữ liệu). Không suy diễn nguyên nhân WAF/lỗi state
+từ số timeout hoặc chênh lệch generated/selected/attempted. Không có bằng chứng
+thì trả lessons_learned rỗng. Đánh giá quyết định là ý kiến chưa được xác minh.
 Phân tích và trả về JSON:
 ```json
 {{
     "lessons_learned": [
         {{
             "lesson": "<bài học rút ra>",
-            "evidence": "<bằng chứng từ phiên này>",
+            "evidence": {{"fact": "<tên fact trong danh mục>", "value": "<giá trị đúng kiểu dữ liệu>"}},
             "applicable_when": {{
                 "<condition_key>": "<condition_value>"
             }},

@@ -16,6 +16,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from src.tools.base_helper import BaseToolHelper, ToolResult
 from src.tools.proxy_profiles import PROXY_OPTION_KEYS
+from src.coordinator.telemetry import mark_http_unknown, record_http_attempt
+from src.coordinator.runtime import cap_timeout
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -112,17 +114,28 @@ class FfufToolHelper(BaseToolHelper):
     def _csv(value: Any) -> str:
         return ",".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
 
+    @staticmethod
+    def _path_mode(target: str, options: dict) -> bool:
+        return ("FUZZ" not in target
+                and "FUZZ" not in str(options.get("post_data", options.get("body", "")))
+                and not any("FUZZ" in f"{key}:{value}"
+                            for key, value in (options.get("headers") or {}).items()))
+
     def _build_cli_command(self, target_url: str, wordlist_file: str, kwargs: Dict[str, Any],
                            output_json: str = "output_samples/ffuf_out.json") -> List[str]:
         binary = self.resolve_binary(kwargs.get("ffuf_binary"))
         if not binary:
             raise ValueError("ffuf executable is not available.")
         headers = kwargs.get("headers") or {}
-        has_keyword = "FUZZ" in target_url or "FUZZ" in str(kwargs.get("post_data", ""))
-        has_keyword = has_keyword or any("FUZZ" in f"{key}:{value}" for key, value in headers.items())
         parsed = urlsplit(target_url)
-        url_pattern = target_url if has_keyword else urlunsplit((parsed.scheme, parsed.netloc,
-                      parsed.path.rstrip("/") + "/FUZZ", parsed.query, ""))
+        # Implicit path inputs include their leading slash on disk. This also
+        # represents root without an empty ffuf input or a double-slash URL.
+        # urlunsplit would insert a slash before FUZZ at an empty base path,
+        # producing // when our slash-prefixed input is substituted. Build
+        # this template explicitly; every serialized path begins with '/'.
+        url_pattern = target_url if not self._path_mode(target_url, kwargs) else (
+            f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}FUZZ"
+            + ("?" + parsed.query if parsed.query else ""))
         timeout = self._positive(kwargs.get("timeout_seconds", kwargs.get("timeout", 10)), "timeout_seconds")
         maxtime = self._positive(kwargs.get("max_scan_seconds", kwargs.get("max_duration_seconds", 120)), "max_scan_seconds")
         threads = self._positive(kwargs.get("threads", 1), "threads")
@@ -188,9 +201,14 @@ class FfufToolHelper(BaseToolHelper):
                 raise ValueError("Wordlist entries must be strings without CR, LF or NUL.")
             value = entry.strip()
             if path_mode:
-                value = value.lstrip("/")
-                if value.startswith(("http://", "https://")):
+                parts = urlsplit(value)
+                if parts.scheme or parts.netloc or value.startswith("//"):
                     raise ValueError("Use relative paths in a path wordlist.")
+                if (parts.fragment or "#" in value or "\\" in value
+                        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+                        or re.search(r"%(?![0-9a-fA-F]{2})|%(?:0[0-9a-f]|1[0-9a-f]|7f)", value, re.I)):
+                    raise ValueError("Invalid path wordlist entry.")
+                value = (value.lstrip("/") or "/") if value else ""
             if value:
                 entries.append(value)
         return list(dict.fromkeys(entries))
@@ -254,8 +272,7 @@ class FfufToolHelper(BaseToolHelper):
                 raise ValueError("Use a target URL without credentials or fragments.")
             if any(ord(character) < 32 for character in target):
                 raise ValueError("target_url cannot contain control characters.")
-            path_mode = "FUZZ" not in target and "FUZZ" not in str(kwargs.get("post_data", ""))
-            path_mode = path_mode and not any("FUZZ" in f"{key}:{value}" for key, value in (kwargs.get("headers") or {}).items())
+            path_mode = self._path_mode(target, kwargs)
             wordlist = self._normalize_wordlist(kwargs.get("wordlist", []), path_mode)
             if not wordlist:
                 raise ValueError("wordlist is empty after normalization.")
@@ -292,10 +309,11 @@ class FfufToolHelper(BaseToolHelper):
                     row.setdefault("input_value", row.get("input"))
                 data.setdefault("stats", {})["matched_responses"] = sum(row.get("status_code") is not None for row in data["results"])
                 data["stats"]["returned_results"] = len(data["results"])
-                data["stopped_early"] = not data.get("completed", False)
-                data["partial"] = data["stopped_early"] or bool(data.get("errors"))
+                data.setdefault("stopped_early", not data.get("completed", False))
+                data["partial"] = not data.get("completed", False) or bool(data.get("errors"))
                 data["stats"].update(partial=data["partial"], stopped_early=data["stopped_early"])
                 success = not data["partial"]
+                data["success"] = success
                 return ToolResult(success, self.name, data, execution_time=time.monotonic() - started,
                                   error_message=None if success else data.get("stop_reason") or "HTTP scan returned errors or partial results.")
             selected_engine, execution_started = "ffuf_cli", True
@@ -319,19 +337,23 @@ class FfufToolHelper(BaseToolHelper):
         parent_dir.mkdir(parents=True, exist_ok=True)
         run_dir = Path(tempfile.mkdtemp(prefix="ffuf_", dir=parent_dir))
         wordlist_path = run_dir / "wordlist.txt"
-        wordlist_path.write_text("\n".join(selected) + "\n", encoding="utf-8")
+        path_mode = self._path_mode(target, options)
+        serialized = ["/" + entry.lstrip("/") for entry in selected] if path_mode else selected
+        wordlist_path.write_text("\n".join(serialized) + "\n", encoding="utf-8")
         output_json = run_dir / "results.json"
         command = self._build_cli_command(target, str(wordlist_path), {**options, "ffuf_binary": binary}, str(output_json))
         safe_command = self._sanitized_command(command)
         logger.info("Executing real HTTP fuzzing: %s", safe_command)
         maxtime = self._positive(options.get("max_scan_seconds", options.get("max_duration_seconds", 120)), "max_scan_seconds")
-        deadline = time.monotonic() + maxtime
+        deadline = time.monotonic() + cap_timeout(maxtime)
         stop_reason, raw_results, consecutive_forbidden = None, [], 0
         threshold = int(self._positive(options.get("block_threshold", options.get("consecutive_403_limit",
                                        options.get("max_consecutive_403", 3))), "block_threshold"))
         stdout_path, stderr_path = run_dir / "stdout.jsonl", run_dir / "stderr.log"
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
             proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL, cwd=str(PROJECT_ROOT))
+            # The process may dispatch requests even if output parsing later fails.
+            mark_http_unknown("ffuf_cli_total_requests_not_exposed")
             with stdout_path.open("r", encoding="utf-8", errors="replace") as live:
                 while True:
                     for line in live:
@@ -367,9 +389,11 @@ class FfufToolHelper(BaseToolHelper):
                 # ffuf's retained config/commandline can contain credentials.
                 output_json.write_text(json.dumps({"results": raw_results}, ensure_ascii=False, indent=2), encoding="utf-8")
             except (ValueError, KeyError, TypeError) as exc:
-                errors.append(f"Invalid ffuf output: {exc}")
+                errors.append({"error_type": "engine_error", "error": f"Invalid ffuf output: {exc}",
+                               "count": 1, "source": "ffuf_output"})
         elif not stop_reason:
-            errors.append("ffuf did not create its result file.")
+            errors.append({"error_type": "engine_error", "error": "ffuf did not create its result file.",
+                           "count": 1, "source": "ffuf_output"})
         if not from_file:
             # A terminated process may have flushed additional completed records.
             raw_results = []
@@ -388,25 +412,41 @@ class FfufToolHelper(BaseToolHelper):
                              " :: Request configuration: <redacted>", stderr_text)
         stderr_path.write_text(stderr_text, encoding="utf-8")
         if returncode != 0 and not stop_reason:
-            errors.append(f"ffuf exited with code {returncode}.")
+            errors.append({"error_type": "engine_error", "error": f"ffuf exited with code {returncode}.",
+                           "count": 1, "source": "ffuf_process"})
         reported_errors = [int(count) for count in re.findall(r"Errors:\s*(\d+)", stderr_text)]
         network_errors = max(reported_errors) if reported_errors else None
         if network_errors:
-            errors.append(f"ffuf reported {network_errors} request errors.")
+            errors.append({"error_type": "transport_error", "error": "ffuf reported request errors.",
+                           "count": network_errors, "source": "ffuf_stderr"})
         lower_stderr = stderr_text.lower()
         if not stop_reason and any(term in lower_stderr for term in ("maxtime", "maximum time", "time limit")):
             stop_reason = "max_scan_seconds"
         if not stop_reason and any(term in lower_stderr for term in ("stopping", "too many", "spurious", "[err]", "[error]")):
             stop_reason = "ffuf_stopped_or_reported_errors"
         observed = [self._normalize_result(row, streamed=not from_file) for row in raw_results]
+        if path_mode:
+            for row in observed:
+                value = row.get("input_value")
+                if isinstance(value, str):
+                    row["input_value"] = value.lstrip("/") or "/"
+        record_http_attempt(kind="ffuf_returned_response_lower_bound", count=sum(
+            isinstance(row.get("status_code"), int) and 100 <= row["status_code"] <= 599
+            for row in observed
+        ))
         results = [row for row in observed if self._keep_result(row, options)]
-        partial = bool(stop_reason or errors or len(selected) < len(wordlist))
         if len(selected) < len(wordlist) and not stop_reason:
             stop_reason = "max_requests"
+        if not stop_reason and errors:
+            stop_reason = ("partial_transport_error" if observed else "transport_error") if network_errors else "execution_error"
+        partial = bool(stop_reason or errors or len(selected) < len(wordlist))
         statuses = sorted({row["status_code"] for row in observed if row["status_code"] is not None})
         stats = {"total_requests": None, "attempted_requests": None,
                  "request_count_source": "not_exposed_by_ffuf_json", "planned_requests": len(selected),
+                 "remaining_requests": None,
+                 "remaining_count_source": "unknown_without_exact_attempted_requests",
                  "response_count_scope": "returned_ffuf_records",
+                 "total_responses_received": None,
                  "request_budget_scope": "input_entries",
                  "returned_count": len(observed), "responses_received": len(observed),
                  "returned_results": len(results), "matched_responses": len(results), "network_errors": network_errors,
@@ -423,7 +463,11 @@ class FfufToolHelper(BaseToolHelper):
         if any(options.get(key) for key in ("extensions", "recursion", "auto_calibrate", "follow_redirects")):
             data["measurement_notes"].append("max_requests caps input entries; extensions, recursion, calibration and redirects can add HTTP requests. The scan deadline still applies.")
         success = returncode == 0 and not partial
+        if success:
+            data["stop_reason"] = stats["stop_reason"] = "completed"
         data["completed"] = success
+        data["success"] = success
+        stats["completed"] = success
         return ToolResult(success, self.name, data, raw_output=stderr_text[:2000],
-                          error_message=None if success else stop_reason or "; ".join(errors),
+                          error_message=None if success else stop_reason or "; ".join(error["error"] for error in errors),
                           execution_time=time.monotonic() - started)

@@ -10,6 +10,8 @@ import ipaddress
 import math
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from src.coordinator.telemetry import record_http_attempt
+from src.coordinator.runtime import cap_http_timeout
 
 
 SOURCE_URL = (
@@ -77,7 +79,8 @@ def fetch_candidates(*, timeout: float = 10.0, limit: int = 20) -> list[str]:
         raise ValueError("Proxy candidate limit must be between 1 and 100")
     request = Request(SOURCE_URL, headers={"User-Agent": "FuzzingTool-ProxyCandidateImporter/2.0"})
     opener = build_opener(ProxyHandler({}), _NoRedirect())
-    with opener.open(request, timeout=timeout) as response:
+    record_http_attempt(kind="proxy_provider")
+    with opener.open(request, timeout=cap_http_timeout(timeout)) as response:
         if response.geturl() != SOURCE_URL or response.status != 200:
             raise ValueError("Proxy provider returned an unexpected response")
         body = response.read(MAX_BYTES + 1)

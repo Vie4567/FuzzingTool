@@ -21,7 +21,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from src.tools.proxy_profiles import PROXY_OPTION_KEYS, ProxyProfilePool
+from src.tools.proxy_profiles import PROXY_OPTION_KEYS, ProxyConnectError, ProxyProfilePool
+from src.coordinator.telemetry import record_http_attempt
+from src.coordinator.runtime import (
+    HttpDispatchDeadline, PipelineStopped, check_deadline, observe_response, current_runtime,
+)
 
 
 progress_logger = logging.getLogger("sentinel.fuzzing.http")
@@ -40,6 +44,11 @@ _ROTATION_OPTIONS = {
     "rotate_ip", "rotate_ips", "ip_rotation", "rotate_proxy", "rotate_proxies",
     "proxy_rotation", "proxy_pool", "proxies", "proxy_list", "tor",
     "tor_control_port", "spoof_ip", "random_ip",
+}
+_CONNECT_STOP_REASONS = {
+    403: "proxy_connect_http_403",
+    429: "rate_limited_429",
+    407: "proxy_authentication_required",
 }
 
 
@@ -73,7 +82,7 @@ def _origin(url: str) -> tuple[str, str, int]:
     return parts.scheme, parts.hostname.lower(), port
 
 
-def _prepare_urls(target_url: str, words: Iterable[str]) -> list[tuple[str, str]]:
+def _prepare_urls(target_url: str, words: Iterable[str], *, path_mode: bool | None = None) -> list[tuple[str, str]]:
     if not isinstance(target_url, str) or any(ord(c) < 32 for c in target_url):
         raise ValueError("target_url must be a URL without control characters")
     origin = _origin(target_url)
@@ -84,7 +93,10 @@ def _prepare_urls(target_url: str, words: Iterable[str]) -> list[tuple[str, str]
         raise ValueError("target_url must not contain a fragment")
     if isinstance(words, (str, bytes)):
         raise ValueError("wordlist must be an iterable of strings")
+    if path_mode is None:
+        path_mode = "FUZZ" not in target_url
     result = []
+    seen = set()
     for word in words:
         if not isinstance(word, str):
             raise ValueError("Every wordlist entry must be a string")
@@ -94,17 +106,28 @@ def _prepare_urls(target_url: str, words: Iterable[str]) -> list[tuple[str, str]
         entry_parts = urlsplit(word)
         if entry_parts.scheme or entry_parts.netloc or word.startswith("//"):
             raise ValueError("Wordlist entries must be relative paths or values, not URLs")
+        if path_mode:
+            if (not word or "#" in word or any(c.isspace() for c in word)
+                    or re.search(r"%(?![0-9a-fA-F]{2})|%(?:0[0-9a-f]|1[0-9a-f]|7f)", word, re.I)):
+                raise ValueError("Invalid path wordlist entry")
+            word = word.lstrip("/") or "/"
         # Query values are encoded as one value. Paths preserve slash separators.
         encoded_path = quote(word.strip("/"), safe="/-._~%")
         if "FUZZ" in target_url:
             path = parts.path.replace("FUZZ", encoded_path)
             query = parts.query.replace("FUZZ", quote(word, safe=""))
         else:
+            if entry_parts.fragment:
+                raise ValueError("Wordlist paths must not contain a fragment")
+            encoded_path = quote(entry_parts.path.strip("/"), safe="/-._~%")
             path = f"{parts.path.rstrip('/')}/{encoded_path}"
-            query = parts.query
+            query = "&".join(q for q in (parts.query, quote(entry_parts.query, safe="/?@:!$&'()*+,;=-._~%")) if q)
         url = urlunsplit((parts.scheme, parts.netloc, path or "/", query, ""))
         if _origin(url) != origin:
             raise ValueError("A wordlist entry would escape the target origin")
+        if path_mode and url in seen:
+            continue
+        seen.add(url)
         result.append((url, word))
     return result
 
@@ -184,6 +207,8 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
     default_duration = 120 if controlled_proxy else 300
     max_duration = _number(options.get("max_duration_seconds", options.get("max_scan_seconds", default_duration)), "max_duration_seconds", 0.01, 600 if controlled_proxy else 3600)
     max_body = _integer(options.get("max_response_bytes", 2 * 1024 * 1024), "max_response_bytes", 1, 64 * 1024 * 1024)
+    if current_runtime():
+        max_body = min(max_body, current_runtime().body_cap)
     block_threshold = _integer(options.get("consecutive_403_limit", options.get("max_consecutive_403", 3)), "consecutive_403_limit", 1, 100)
     max_backoff = _number(options.get("max_retry_after_seconds", 30), "max_retry_after_seconds", 0, 300)
     method = str(options.get("http_method", options.get("method", "GET"))).upper()
@@ -218,7 +243,12 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
             raise ValueError("Invalid fixed proxy port") from exc
     # Ignore ambient proxy environment variables unless explicitly configured.
     opener = None if controlled_proxy else build_opener(ProxyHandler({"http": proxy, "https": proxy} if proxy else {}), _NoRedirect())
-    urls = _prepare_urls(target_url, wordlist)
+    path_mode = ("FUZZ" not in target_url and "FUZZ" not in str(body or "")
+                 and not any("FUZZ" in f"{key}:{value}" for key, value in headers.items()))
+    urls = _prepare_urls(target_url, wordlist, path_mode=path_mode)
+    if pool is not None:
+        from .verification_http import forget_proxy_pool
+        forget_proxy_pool(target_url, options)
     started = time.perf_counter()
     deadline = started + max_duration
     next_start = started
@@ -239,6 +269,13 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
 
     def budget_available():
         nonlocal stop_reason
+        budget = current_runtime()
+        if budget:
+            try:
+                budget.check()
+            except TimeoutError:
+                stop_reason = budget.stop_reason
+                return False
         if len(attempts) >= max_requests:
             stop_reason = "max_requests"
             return False
@@ -260,8 +297,6 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
             time.sleep(wait)
         if not budget_available():
             return None
-        request_started = time.perf_counter()
-        next_start = request_started + max(1 / rate, delay)
         if healthcheck:
             request_body = None
         elif isinstance(body, str):
@@ -283,7 +318,28 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         if profile is not None:
             profile_id, request_opener = profile
             record.update(proxy_profile_id=profile_id, egress_ip=None,
-                          egress_ip_verification="not_measured")
+                          egress_ip_verification="not_measured",
+                          proxy_connect_status=None, proxy_connect_headers={})
+        # Reservation can reject a request before network dispatch. Such a
+        # rejection is not an attempted request or a transport failure.
+        try:
+            record_http_attempt(
+                kind="proxy_healthcheck" if healthcheck else "target",
+                deadline=time.monotonic() + max(0, deadline - time.perf_counter()),
+            )
+        except (PipelineStopped, HttpDispatchDeadline) as exc:
+            stop_reason = ("max_duration" if isinstance(exc, HttpDispatchDeadline)
+                           else current_runtime().stop_reason if current_runtime() and current_runtime().stop_reason
+                           else "pipeline_deadline")
+            return None
+        request_started = time.perf_counter()
+        next_start = request_started + max(1 / rate, delay)
+        request_timeout = min(pool.check_timeout if healthcheck else timeout,
+                              max(0.001, deadline - request_started))
+        budget = current_runtime()
+        if budget is not None:
+            request_timeout = max(0.001, min(request_timeout, budget.timeout,
+                                            budget.deadline - time.monotonic()))
         progress_profile = record.get("proxy_profile_id", "fixed_proxy" if proxy else "direct")
         progress_logger.info(
             "START request=%d/%d profile=%s method=%s path=%s kind=%s",
@@ -293,10 +349,7 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         response = None
         try:
             try:
-                response = request_opener.open(request, timeout=min(
-                    pool.check_timeout if healthcheck else timeout,
-                    max(0.01, deadline - request_started),
-                ))
+                response = request_opener.open(request, timeout=request_timeout)
             except HTTPError as exc:
                 response = exc
             record["status_code"] = response.code
@@ -310,6 +363,7 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
                 record["redirect_url"] = pool.redact(redirect) if pool is not None else redirect
             record["content_length"] = 0
             while record["content_length"] < max_body:
+                check_deadline()
                 if time.perf_counter() >= deadline:
                     raise TimeoutError("Run duration limit reached while reading the response")
                 try:
@@ -331,9 +385,19 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
                 record["body_truncated"] = not record["body_complete"]
         except (URLError, OSError, ValueError, HTTPException) as exc:
             reason = getattr(exc, "reason", exc)
+            if isinstance(exc, PipelineStopped):
+                stop_reason = current_runtime().stop_reason or "pipeline_deadline"
+            elif time.perf_counter() >= deadline:
+                stop_reason = "max_duration"
+            if isinstance(reason, ProxyConnectError):
+                record["proxy_connect_status"] = reason.status
+                record["proxy_connect_headers"] = {
+                    key: pool.redact(value) for key, value in reason.headers.items()
+                }
             message = f"{type(reason).__name__}: {reason}"
             record["error"] = pool.redact(message) if pool is not None else message
         finally:
+            observe_response(record.get("proxy_connect_status") or record.get("status_code"), record.get("headers"))
             record["response_time"] = time.perf_counter() - request_started
             if response is not None:
                 response.close()
@@ -341,14 +405,32 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         attempts.append(record)
         (health_checks if healthcheck else results).append(record)
         progress_logger.info(
-            "RESULT request=%d profile=%s status=%s bytes=%s seconds=%.6f error=%s",
+            "RESULT request=%d profile=%s status=%s connect_status=%s bytes=%s seconds=%.6f error=%s",
             len(attempts), progress_profile, record["status_code"],
+            record.get("proxy_connect_status"),
             record["content_length"], record["response_time"],
             (record["error"] if pool is not None else "yes") if record["error"] else "none",
         )
         if record["error"] and not healthcheck:
-            errors.append({"url": url, "error": record["error"], "status_code": record["status_code"]})
+            error = {"url": url, "error": record["error"], "status_code": record["status_code"]}
+            if record.get("proxy_connect_status") is not None:
+                error["proxy_connect_status"] = record["proxy_connect_status"]
+            errors.append(error)
         return record
+
+    def stop_on_connect_restriction(record):
+        """Stop before another profile, refresh or target request is selected."""
+        nonlocal stop_reason
+        status = record.get("proxy_connect_status")
+        if status not in _CONNECT_STOP_REASONS:
+            return False
+        stop_reason = _CONNECT_STOP_REASONS[status]
+        identifier = record["proxy_profile_id"]
+        if status == 407:
+            pool.exclude(identifier, stop_reason)
+        else:
+            pool.mark_check_stopped(identifier, stop_reason)
+        return True
 
     def prepare_pool():
         """Refresh and vet pending routes before choosing a fuzzing route."""
@@ -374,6 +456,8 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
             if record is None:
                 pool.mark_check_stopped(identifier, stop_reason)
                 return False
+            if stop_on_connect_restriction(record):
+                return False
             status = record["status_code"]
             # A target's access restriction is not evidence of a dead proxy.
             # Do not check another route to get around this response.
@@ -386,7 +470,8 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
                     pool.mark_check_stopped(identifier, stop_reason)
                 return False
             healthy = status is not None and 200 <= status < 300 and not record["error"] and record["body_complete"]
-            reason = None if healthy else "transport_error" if record["error"] else "healthcheck_response_rejected"
+            reason = (None if healthy else "proxy_connect_error" if record.get("proxy_connect_status") is not None
+                      else "transport_error" if record["error"] else "healthcheck_response_rejected")
             pool.mark_checked(identifier, healthy, reason)
             progress_logger.info("PROXY_CHECK profile=%s healthy=%s status=%s reason=%s",
                                  identifier, healthy, status, reason)
@@ -414,6 +499,8 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         record = measure(url, word, profile=selected_profile)
         if record is None:
             break
+        if pool is not None and stop_on_connect_restriction(record):
+            break
         status = record["status_code"]
         consecutive_403 = consecutive_403 + 1 if status == 403 else 0
         if pool is not None:
@@ -437,30 +524,48 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
             pool.exclude(record["proxy_profile_id"], stop_reason)
             break
         if controlled_proxy and record["error"]:
-            stop_reason = "max_duration" if time.perf_counter() >= deadline else "transport_error"
+            if stop_reason == "completed":
+                stop_reason = ("proxy_connect_error" if record.get("proxy_connect_status") is not None
+                               else "max_duration" if time.perf_counter() >= deadline else "transport_error")
             pool.exclude(record["proxy_profile_id"], stop_reason)
             break
 
     elapsed = time.perf_counter() - started
     received = [r for r in attempts if r["status_code"] is not None]
     complete = [r for r in received if r["error"] is None]
+    fuzzing_received = sum(r["status_code"] is not None for r in results)
+    if stop_reason == "completed":
+        budget = current_runtime()
+        if budget is not None and budget.stop_reason:
+            stop_reason = budget.stop_reason
+        elif errors:
+            stop_reason = "partial_transport_error" if fuzzing_received else "transport_error"
+    remaining = len(urls) - len(results)
+    completed = remaining == 0 and stop_reason == "completed" and not errors
     stats = {
         "planned_requests": len(urls), "total_requests": len(attempts),
         "attempted_requests": len(attempts), "responses_received": len(received),
         "fuzzing_requests": len(results), "healthcheck_requests": len(health_checks),
-        "successful_responses": len(complete), "network_errors": sum(bool(r["error"]) for r in attempts),
-        "remaining_requests": len(urls) - len(results),
+        "fuzzing_responses_received": fuzzing_received,
+        "fuzzing_network_errors": sum(bool(r["error"]) and r.get("proxy_connect_status") is None for r in results),
+        "healthcheck_responses_received": sum(r["status_code"] is not None for r in health_checks),
+        "healthcheck_network_errors": sum(bool(r["error"]) and r.get("proxy_connect_status") is None for r in health_checks),
+        "successful_responses": len(complete),
+        "network_errors": sum(bool(r["error"]) and r.get("proxy_connect_status") is None for r in attempts),
+        "remaining_requests": remaining,
+        "completed": completed, "partial": not completed, "stopped_early": remaining > 0,
         "status_codes": dict(Counter(str(r["status_code"]) for r in received)),
         "avg_response_time": sum(r["response_time"] for r in complete) / len(complete) if complete else None,
         "wall_time": elapsed, "stop_reason": stop_reason,
         "potential_block_responses": sum(r["status_code"] in {403, 429} for r in attempts),
         "bytes_read": sum(r["content_length"] or 0 for r in attempts),
-        "metric_scope": "All attempted target requests, including proxy health checks; provider fetches are separate. Redirects are not followed. HTTP error statuses are responses; network errors are separate. Length counts body bytes read; time includes reading the body and excludes rate-limit waits.",
+        "metric_scope": "All attempted target requests, including proxy health checks; provider fetches are separate. Redirects are not followed. Target HTTP error statuses are responses; proxy CONNECT rejections and network errors are separate. Length counts target body bytes read; time includes reading the body and excludes rate-limit waits.",
     }
     data = {
         "engine": "proxy_http" if controlled_proxy else "python_http", "simulated": False, "results": results,
         "stats": stats, "errors": errors, "warnings": warnings,
-        "stop_reason": stop_reason, "completed": len(results) == len(urls) and stop_reason == "completed",
+        "stop_reason": stop_reason, "completed": completed,
+        "partial": not completed, "success": completed, "stopped_early": remaining > 0,
         "settings": {"rate_limit": rate, "delay_ms": delay * 1000, "workers": 1,
                      "timeout_seconds": timeout, "max_requests": max_requests,
                      "max_duration_seconds": max_duration, "max_response_bytes": max_body,
@@ -475,6 +580,9 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         data["proxy_pool"] = pool.snapshot()
         data["proxy_refresh_events"] = refresh_events
         stats["proxy_source_fetches"] = len(refresh_events)
+        connect_errors = [row for row in attempts if row.get("proxy_connect_status") is not None]
+        stats["proxy_connect_errors"] = len(connect_errors)
+        stats["proxy_connect_status_codes"] = dict(Counter(str(row["proxy_connect_status"]) for row in connect_errors))
         stats["proxy_profile_requests"] = dict(Counter(row["proxy_profile_id"] for row in attempts))
         stats["proxy_profiles"] = {}
         for identifier in pool.all_profile_ids:
@@ -486,7 +594,9 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
                 "healthcheck_requests": sum(r["request_kind"] == "healthcheck" for r in rows),
                 "fuzzing_requests": sum(r["request_kind"] == "fuzzing" for r in rows),
                 "responses": sum(r["status_code"] is not None for r in rows),
-                "network_errors": sum(bool(r["error"]) for r in rows),
+                "network_errors": sum(bool(r["error"]) and r.get("proxy_connect_status") is None for r in rows),
+                "proxy_connect_errors": sum(r.get("proxy_connect_status") is not None for r in rows),
+                "proxy_connect_status_codes": dict(Counter(str(r["proxy_connect_status"]) for r in rows if r.get("proxy_connect_status") is not None)),
                 "http_errors": sum(r["status_code"] is not None and r["status_code"] >= 400 for r in rows),
                 "error_rate": failures / count if count else None,
                 "avg_response_time": sum(r["response_time"] for r in rows) / count if count else None,
@@ -504,4 +614,7 @@ def run_http_fuzzing(target_url: str, wordlist: Iterable[str], **options: Any) -
         "STOP reason=%s attempted=%d responses=%d bytes=%d",
         stop_reason, stats["attempted_requests"], stats["responses_received"], stats["bytes_read"],
     )
+    if pool is not None and data["completed"] and not errors:
+        from .verification_http import publish_proxy_pool
+        publish_proxy_pool(target_url, options, pool)
     return data

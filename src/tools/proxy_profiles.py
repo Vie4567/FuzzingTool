@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from http.client import HTTPException, HTTPSConnection
 import ipaddress
 import json
 import math
 import os
 import re
 from urllib.parse import unquote, urlsplit
-from urllib.request import BaseHandler, HTTPRedirectHandler, ProxyHandler, build_opener
+from urllib.request import BaseHandler, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, build_opener
 
 from . import proxyscrape
 
@@ -25,6 +26,12 @@ PROXY_OPTION_KEYS = frozenset({
     "proxy_refresh_seconds", "proxy_healthcheck_url", "proxy_check_timeout_seconds",
 })
 OPERATOR_PROXY_OPTIONS = PROXY_OPTION_KEYS | {"engine"}
+# Model plans at either Coordinator or agent level cannot authorize a network
+# route or weaken scope/TLS. Keep the engine-specific config key set separate.
+OPERATOR_NETWORK_OPTIONS = OPERATOR_PROXY_OPTIONS | {
+    "proxy", "lab_source_ips", "source_ip", "source_address",
+    "auth_origins", "verify", "verify_ssl", "insecure", "ssl_context", "tls_ca_file",
+}
 
 
 def _number(value, name, minimum, maximum, *, integer=False):
@@ -122,6 +129,56 @@ class _ExplicitProxy(ProxyHandler):
         # the encrypted target request. Its default HTTPSHandler verifies TLS.
         request.set_proxy(self._endpoint, "http")
         return None
+
+
+class ProxyConnectError(OSError):
+    """A measured proxy CONNECT rejection, not a response from the target."""
+
+    def __init__(self, status, headers):
+        self.status = status
+        # Do not retain proxy reason phrases, bodies or arbitrary headers that
+        # could echo credentials. The engine redacts this selected value too.
+        retry_after = headers.get("Retry-After")
+        self.headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        super().__init__(f"Proxy CONNECT returned HTTP {status}")
+
+
+class _ProxyHTTPSConnection(HTTPSConnection):
+    def _tunnel(self):
+        status = None
+        original_response_class = self.response_class
+
+        class ConnectResponse(original_response_class):
+            def _read_status(self):
+                nonlocal status
+                version, status, reason = super()._read_status()
+                return version, status, reason
+
+        # Observe the validated status before header parsing can fail. Delegate
+        # CONNECT formatting, header limits and socket cleanup to http.client;
+        # the per-connection hook never changes parsing of target responses.
+        self.response_class = ConnectResponse
+        try:
+            super()._tunnel()
+        except (OSError, HTTPException):
+            if status is not None and status != 200:
+                try:
+                    headers = self.get_proxy_response_headers() or {}
+                except Exception:
+                    # Missing/malformed metadata must not discard a known
+                    # access restriction or turn it into a failover opportunity.
+                    headers = {}
+                raise ProxyConnectError(status, headers) from None
+            raise
+        finally:
+            self.response_class = original_response_class
+
+
+class _ProxyHTTPSHandler(HTTPSHandler):
+    def https_open(self, request):
+        # Keep urllib's standard TLS context, SNI and separation of proxy auth
+        # from the encrypted target request. No automatic retry is introduced.
+        return self.do_open(_ProxyHTTPSConnection, request, context=self._context)
 
 
 class ProxyProfilePool:
@@ -370,16 +427,22 @@ class ProxyProfilePool:
         if identifier in self._pending:
             self._pending.remove(identifier)
 
-    def opener_by_id(self, identifier):
+    def opener_by_id(self, identifier, *, ssl_context=None):
         record = self._records[identifier]
         if record["state"] in {"excluded", "expired"}:
             raise ValueError("Proxy profile is unavailable")
         _, endpoint, authorization = record["profile"]
-        if identifier not in self._openers:
-            self._openers[identifier] = build_opener(
-                _ScopeGuard(self._origins), _ExplicitProxy(endpoint, authorization), _NoRedirect()
+        if ssl_context is not None:
+            import ssl
+            if not ssl_context.check_hostname or ssl_context.verify_mode != ssl.CERT_REQUIRED:
+                raise ValueError("Proxy TLS verification cannot be disabled")
+        key = identifier if ssl_context is None else (identifier, ssl_context)
+        if key not in self._openers:
+            self._openers[key] = build_opener(
+                _ScopeGuard(self._origins), _ExplicitProxy(endpoint, authorization),
+                _NoRedirect(), _ProxyHTTPSHandler(context=ssl_context),
             )
-        return self._openers[identifier]
+        return self._openers[key]
 
     def next_opener(self):
         if not self._active:

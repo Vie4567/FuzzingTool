@@ -15,6 +15,7 @@ import os
 import json
 import re
 import logging
+from itertools import islice
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -58,6 +59,68 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _bounded_recon_context(profile: dict = None, target_url: str = "") -> dict:
+    """A bounded view for an existing prompt; the full evidence stays in state.
+
+    Selected records retain classification labels; truncation is explicit. Nothing in this view grants
+    permission to change target origins or promotes a candidate to a finding.
+    """
+    profile = profile if isinstance(profile, dict) else {}
+    remaining = 6000
+    nodes = 192
+
+    def bounded(value, depth=0):
+        nonlocal remaining, nodes
+        if remaining <= 0 or nodes <= 0:
+            return "[summary limit]"
+        nodes -= 1
+        if isinstance(value, str):
+            text = value[:min(240, remaining)]
+            remaining -= max(1, len(text))
+            return text
+        if value is None or isinstance(value, (bool, int, float)):
+            remaining -= 8
+            return value
+        if depth >= 5:
+            return "[depth limit]"
+        if isinstance(value, list):
+            output = []
+            for item in value[:12]:
+                if remaining <= 0 or nodes <= 0:
+                    break
+                output.append(bounded(item, depth + 1))
+            if len(output) < len(value):
+                output.append({"truncated": True})
+            return output
+        if isinstance(value, dict):
+            # Classification must not disappear behind large content fields.
+            output = {}
+            if "classification" in value:
+                output["classification"] = bounded(value["classification"], depth + 1)
+            items = ((key, item) for key, item in value.items() if key != "classification")
+            for key, item in islice(items, 16 - len(output)):
+                if remaining <= 0 or nodes <= 0:
+                    break
+                key = str(key)[:64]
+                remaining -= max(1, len(key))
+                output[key] = bounded(item, depth + 1)
+            if len(output) < len(value):
+                output["truncated"] = True
+            return output
+        return "[unsupported value]"
+
+    summary = {
+        "schema_version": bounded(profile.get("schema_version")),
+        "target_url": bounded(target_url),
+        "interpretation": "observed=collected evidence; candidate=unverified; inferred=hypothesis. HTTP200 does not verify an endpoint. Origins are context, not scope authorization.",
+        "counts": {key: len(profile.get(key, [])) if isinstance(profile.get(key, []), list) else 0
+                   for key in ("paths", "parameters", "forms")},
+    }
+    for key in ("architecture", "technology_evidence", "parameters", "forms", "api_context", "paths"):
+        summary[key] = bounded(profile.get(key, [] if key in {"paths", "parameters", "forms", "technology_evidence"} else {}))
+    return sanitize_for_log(summary)
+
+
 class WordlistGenAgent(BaseAutonomousAgent):
     """Wordlist Generator Agent — Phan tich Dev Profile & Sinh Wordlist tu chu voi LLM."""
 
@@ -90,12 +153,16 @@ class WordlistGenAgent(BaseAutonomousAgent):
         tech_stack: dict,
         discovered_paths: list,
         js_endpoints: list = None,
+        *, target_url: str = "", recon_profile: dict = None,
     ) -> dict:
         """Su dung LLM phan tich 8 chieu thoi quen cua developer."""
         combined_paths = list(dict.fromkeys((discovered_paths or []) + (js_endpoints or [])))
         sample_paths = combined_paths[:60]
 
         fallback_profile = self._build_heuristic_dev_profile(tech_stack, combined_paths)
+        context = _bounded_recon_context(recon_profile, target_url)
+        fallback_profile["recon_context"] = context
+        fallback_profile["classification"] = "inferred"
 
         if not self.llm:
             return fallback_profile
@@ -103,13 +170,18 @@ class WordlistGenAgent(BaseAutonomousAgent):
         prompt_system = (
             "Ban la Senior Security Architect & Code Auditor chuyen phan tich phong cach lap trinh, "
             "thoi quen dat ten va kien truc API cua team phat trien web (Developer Habit Profiling).\n"
-            "Hay phan tich danh sach cac endpoint thuc te va tra ve DUY NHAT mot chuoi JSON chuan mo ta "
-            "DevProfile theo 8 chieu phan tich."
+            "Hay phan tich cac duong dan quan sat va ung vien; tra ve DUY NHAT JSON DevProfile. "
+            "Keep observed evidence, unverified candidates and inferred hypotheses distinct. "
+            "A linked path or HTTP200 is not a verified endpoint. Do not treat inferred architecture "
+            "or candidate API origins as confirmed technologies or authorization to change scope."
         )
 
         prompt_user = f"""
 DU LIEU DAU VAO TU RECON:
 - Tech Stack: {json.dumps(tech_stack, ensure_ascii=False)}
+- Target URL: {json.dumps(target_url, ensure_ascii=False)}
+- Structured Recon context (bounded; original classifications retained):
+{json.dumps(context, ensure_ascii=False)}
 - Mau Endpoints phat hien duoc:
 {json.dumps(sample_paths, indent=2, ensure_ascii=False)}
 
@@ -156,6 +228,8 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
             if m:
                 llm_data = json.loads(m.group(0))
                 dev_profile = {
+                    "classification": "inferred",
+                    "recon_context": context,
                     "target_profile": {
                         "backend_stack": tech_stack.get("backend", tech_stack.get("backend_language", "unknown")),
                         "web_server": tech_stack.get("web_server", "unknown"),
@@ -359,8 +433,12 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
         tech_stack: dict,
         discovered_paths: list,
         js_endpoints: list = None,
+        *, target_url: str = None, recon_profile: dict = None,
     ) -> dict:
         """Sinh Wordlist da tang toi uu hoa theo Target Profile."""
+        # The caller's target wins over inferred backend origins and the old
+        # tech_stack URL alias. Never change network scope from Recon guesses.
+        target_url = target_url if target_url is not None else tech_stack.get("target_url", "")
         backend = tech_stack.get("backend", tech_stack.get("backend_language", "unknown"))
         cms = tech_stack.get("cms", "unknown")
         all_recon_paths = list(dict.fromkeys((discovered_paths or []) + (js_endpoints or [])))
@@ -369,7 +447,10 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
 
         try:
             # 1. Phan tich Developer Profile bang LLM
-            dev_profile = self._analyze_dev_profile_with_llm(tech_stack, discovered_paths, js_endpoints)
+            dev_profile = self._analyze_dev_profile_with_llm(
+                tech_stack, discovered_paths, js_endpoints,
+                target_url=target_url, recon_profile=recon_profile,
+            )
 
             output_dir = Path("output_samples")
             output_dir.mkdir(exist_ok=True)
@@ -388,7 +469,6 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
             assembler_meta = assembler_result.get("metadata", {})
 
             # 3. SensitiveFilesAssembler: sinh sensitive & backup files theo tung thanh phan voi LLM enrichment
-            target_url = tech_stack.get("target_url", "")
             sensitive_result = self._run_sensitive_assembler(
                 target_url=target_url,
                 tech_stack=tech_stack,
@@ -439,7 +519,7 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
             wordlist_set = set()
 
             # Layer 1: Knowledge Base Wordlists (Theo Framework/Tech)
-            knowledge_wl_dir = Path("knowledge/wordlists")
+            knowledge_wl_dir = Path(__file__).resolve().parents[2] / "knowledge/wordlists"
             if knowledge_wl_dir.exists():
                 target_keywords = []
                 if cms and cms != "unknown":
@@ -504,6 +584,12 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
                     "endpoint_candidate_sources": ["observed_paths", "llm_components", "knowledge"],
                     "llm_predicted_paths_is_legacy_alias": True,
                     "recon_paths_included": len(all_recon_paths),
+                    "recon_context": {
+                        "schema_version": (recon_profile or {}).get("schema_version"),
+                        "target_url": target_url,
+                        "counts": dev_profile.get("recon_context", {}).get("counts", {}),
+                        "classification": "candidate_generation_only",
+                    },
                     "assembler_endpoints": len(assembler_endpoints),
                     "llm_predicted_paths": len(assembler_endpoints),
                     "sensitive_paths_count": len(sensitive_paths),
@@ -530,6 +616,7 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
         discovered_paths: list,
         js_endpoints: list = None,
         directive: dict = None,
+        *, target_url: str = None, recon_profile: dict = None,
     ) -> dict:
         """Sinh Wordlist tu chu voi giai trinh ly do (Autonomous Subagent)."""
         backend = tech_stack.get("backend", tech_stack.get("backend_language", "unknown"))
@@ -545,7 +632,10 @@ OUTPUT FORMAT (KHONG CO MARKDOWN HAY GIAI THICH):
             wordlist_tools = self.tool_registry.list_tools(filter_names=["wordlist_generator_tool"])
             execution_history = []
 
-            result = self._generate_wordlist_internal(tech_stack, discovered_paths, js_endpoints)
+            result = self._generate_wordlist_internal(
+                tech_stack, discovered_paths, js_endpoints,
+                target_url=target_url, recon_profile=recon_profile,
+            )
 
             plan = self.plan_tool_execution(
                 task_directive=task_directive,

@@ -37,7 +37,7 @@ class Fixture(BaseHTTPRequestHandler):
         try:
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def log_message(self, *args):
@@ -85,6 +85,34 @@ class FfufHelperTests(unittest.TestCase):
         self.assertFalse(result.result_data["simulated"])
         self.assertIsNone(result.result_data["stats"]["attempted_requests"])
         self.assertEqual(sorted(Fixture.calls), ["/missing", "/ok"])
+
+    def test_path_root_and_aliases_are_kept_once_by_both_engines(self):
+        for engine in ("python_http", "ffuf_cli"):
+            if engine == "ffuf_cli" and not self.binary:
+                continue
+            for suffix in ("", "/base"):
+                with self.subTest(engine=engine, suffix=suffix):
+                    Fixture.calls.clear()
+                    result = self.helper.run(target_url=self.url + suffix,
+                        wordlist=["/", "/admin", "admin", "login", "/"],
+                        engine=engine, rate_limit=100, auto_calibrate=False)
+                    self.assertTrue(result.success, result.to_dict())
+                    self.assertEqual(sorted(Fixture.calls),
+                                     sorted([suffix + "/", suffix + "/admin", suffix + "/login"]))
+                    self.assertEqual(result.result_data["stats"]["planned_requests"], 3)
+                    self.assertEqual({r["input_value"] for r in result.result_data["results"]},
+                                     {"/", "admin", "login"})
+                    self.assertEqual({r["path"] for r in result.result_data["results"]},
+                                     {suffix + "/", suffix + "/admin", suffix + "/login"})
+
+    def test_normalization_keeps_root_and_rejects_scope_escapes_before_stripping(self):
+        self.assertEqual(self.helper._normalize_wordlist(["/", "/admin", "admin", "login", "/"], True),
+                         ["/", "admin", "login"])
+        for invalid in ("//outside.test/x", "https://outside.test/x", "a\\b", "x#frag", "%0a", "bad path"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.helper._normalize_wordlist([invalid], True)
+        self.assertEqual(self.helper._normalize_wordlist(["/", "/admin", "admin", "a b"], False),
+                         ["/", "/admin", "admin", "a b"])
 
     def test_redirect_option_is_applied(self):
         result = self.run_ffuf(["redirect"])
@@ -173,6 +201,27 @@ class FfufHelperTests(unittest.TestCase):
         self.assertEqual(result.result_data["results"][0]["status_code"], 429)
         self.assertEqual(Fixture.calls, ["/rate"])
 
+    def test_native_all_timeouts_do_not_report_completed_reason(self):
+        result = self.helper.run(target_url=self.url, wordlist=["slow"], engine="python_http",
+                                 rate_limit=100, timeout_seconds=0.03)
+        self.assertFalse(result.success)
+        self.assertFalse(result.result_data["completed"])
+        self.assertTrue(result.result_data["partial"])
+        self.assertEqual(result.error_message, "transport_error")
+        self.assertEqual(result.result_data["stats"]["attempted_requests"], 1)
+        self.assertEqual(result.result_data["stats"]["responses_received"], 0)
+
+    def test_cli_remaining_attempts_stay_unknown_even_after_success(self):
+        result = self.run_ffuf(["ok", "missing"])
+        self.assertTrue(result.success, result.to_dict())
+        stats = result.result_data["stats"]
+        self.assertEqual(stats["planned_requests"], 2)
+        self.assertIsNone(stats["attempted_requests"])
+        self.assertIsNone(stats["remaining_requests"])
+        self.assertIsNone(stats["total_responses_received"])
+        self.assertEqual(stats["responses_received"], 2)
+        self.assertEqual(stats["response_count_scope"], "returned_ffuf_records")
+
     def test_connection_failure_is_not_success_or_fallback(self):
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
@@ -184,6 +233,8 @@ class FfufHelperTests(unittest.TestCase):
             fallback.assert_not_called()
         self.assertFalse(result.success, result.to_dict())
         self.assertEqual(result.result_data["results"], [])
+        self.assertIsNotNone(result.result_data["stop_reason"])
+        self.assertNotEqual(result.result_data["stop_reason"], "completed")
 
     def test_logs_and_artifacts_omit_credentials(self):
         result = self.run_ffuf(["ok"], headers={"Authorization": "Bearer unique-test-secret"})
@@ -192,6 +243,20 @@ class FfufHelperTests(unittest.TestCase):
         directory = Path(result.result_data["output_dir"])
         self.assertNotIn("unique-test-secret", (directory / "results.json").read_text())
         self.assertNotIn("unique-test-secret", (directory / "stderr.log").read_text())
+
+    def test_cli_request_cap_reason_survives_transport_errors(self):
+        if not self.binary:
+            self.skipTest("ffuf is not installed")
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        result = self.helper.run(target_url=f"http://127.0.0.1:{port}", wordlist=["one", "two"],
+                                 engine="ffuf_cli", ffuf_binary=self.binary, max_requests=1,
+                                 timeout_seconds=1, max_scan_seconds=3)
+        self.assertFalse(result.success)
+        self.assertEqual(result.result_data["stop_reason"], "max_requests")
+        self.assertTrue(result.result_data["errors"])
 
     def test_target_query_is_preserved_but_redacted_from_logs(self):
         if not self.binary:

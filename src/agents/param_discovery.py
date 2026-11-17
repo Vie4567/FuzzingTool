@@ -11,6 +11,7 @@ import logging
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin, urlsplit
 
 from src.coordinator.logger import (
     log_agent_start,
@@ -25,6 +26,8 @@ from src.coordinator.logger import (
 from src.agents.base_agent import BaseAutonomousAgent
 from src.agents.param_assembler import ParameterAssembler
 from src.tools.registry import default_registry
+from src.tools.parameter_verification import verify_parameters, parameter_options_from_config
+from src.coordinator.llm_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +49,11 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
         path_lower = path.lower()
         matched = []
 
-        id_params = assembled_components.get("id_lookup", ["id", "uuid"])
-        biz_params = assembled_components.get("business_fields", ["q", "filter", "category"])
-        action_params = assembled_components.get("action_control", ["action", "mode", "view"])
-        pag_params = assembled_components.get("pagination_sort", ["page", "limit", "sort"])
-        sec_params = assembled_components.get("debug_security", ["debug", "admin", "format"])
+        id_params = assembled_components.get("id_lookup") or ["id", "uuid"]
+        biz_params = assembled_components.get("business_fields") or ["q", "filter", "category"]
+        action_params = assembled_components.get("action_control") or ["action", "mode", "view"]
+        pag_params = assembled_components.get("pagination_sort") or ["page", "limit", "sort"]
+        sec_params = assembled_components.get("debug_security") or ["debug", "admin", "format"]
 
         # Trích xuất segment từ path (VD: /api/v1/orders/detail -> segments: api, v1, orders, detail)
         segments = [s for s in path_lower.strip("/").split("/") if s and not re.match(r'^\d+$', s)]
@@ -107,7 +110,7 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
           2. Khớp các tham số tiềm năng nhất cho từng HTTP 200 endpoint.
         """
         observed_paths = [
-            e.get("path", e) if isinstance(e, dict) else e
+            (e.get("url") or e.get("path") or "") if isinstance(e, dict) else str(e)
             for e in endpoints
         ]
 
@@ -131,8 +134,12 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
 
         param_results = []
         for endpoint in endpoints[:5]:  # Giới hạn 5 endpoints trọng điểm
-            path = endpoint.get("path", endpoint) if isinstance(endpoint, dict) else endpoint
-            full_url = f"{target_url.rstrip('/')}{path if str(path).startswith('/') else '/' + str(path)}"
+            source = endpoint if isinstance(endpoint, dict) else {}
+            reference = (source.get("url") or source.get("path") or "") if source else str(endpoint)
+            if not isinstance(reference, str) or not reference:
+                continue
+            full_url = urljoin(target_url.rstrip("/") + "/", reference)
+            path = urlsplit(full_url).path or "/"
 
             matched_params = self._match_params_for_path(str(path), components, naming_style)
 
@@ -145,6 +152,14 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
                 "result_kind": "parameter_candidates",
                 "verification": "not_checked",
                 "verification_performed": False,
+                "source_status_code": source.get("status_code"),
+                "source_method": source.get("http_method", source.get("method", "GET")),
+                "source_error": source.get("error"),
+                "source_simulated": source.get("simulated", False),
+                "source_body_complete": source.get("body_complete"),
+                "source_body_truncated": source.get("body_truncated", False),
+                "source_proxy_profile_id": source.get("proxy_profile_id"),
+                "source_retry_after": any(str(key).lower() == "retry-after" for key in (source.get("headers") or {})),
             })
 
         return {
@@ -165,8 +180,18 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
         tech_stack: dict = None,
         dev_profile: dict = None,
         directive: dict = None,
+        verification_options: dict = None,
     ) -> dict:
-        log_agent_start("ParamDiscoveryAgent", target_url, params={"endpoints_count": len(endpoints)})
+        def redact(value):
+            options = verification_options or {}
+            proxy = options.get("proxy_options") or {}
+            # Profile IDs and routing policy are evidence, not credentials.
+            credentials = [row.get("url") for row in proxy.get("proxy_profiles", []) if isinstance(row, dict)]
+            return sanitize_for_log({"headers": options.get("headers", {}),
+                                     "credentials": credentials, "payload": value})["payload"]
+
+        res = None
+        log_agent_start("ParamDiscoveryAgent", redact(target_url), params={"endpoints_count": len(endpoints)})
 
         try:
             task_directive = directive or {
@@ -212,8 +237,8 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
             agent_logger.info(
                 f"\n{COLOR_MAGENTA}[SUB-AGENT TOOL PLAN - ParamDiscoveryAgent; chưa thực thi]{COLOR_RESET}\n"
                 f"   ├─ Planned Tool: {tool_log_entry['selected_tool']}\n"
-                f"   ├─ Tool Reason: {tool_log_entry['tool_selection_reason']}\n"
-                f"   └─ Options Reason: {tool_log_entry['options_selection_reason']}"
+                f"   ├─ Tool Reason: {redact(tool_log_entry['tool_selection_reason'])}\n"
+                f"   └─ Options Reason: {redact(tool_log_entry['options_selection_reason'])}"
             )
 
             justification = (
@@ -232,17 +257,51 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
             res["tools_executed"] = []
             res["subagent_justification"] = justification
 
+            verification = verify_parameters(
+                target_url, res["param_results"],
+                **({"enabled": False} if verification_options is None else verification_options),
+            )
+            res.update(verification)
+            if verification["verification_performed"]:
+                res["tools_executed"] = [{"selected_tool": "parameter_http_verifier",
+                                          "total_requests": verification["stats"]["total_requests"]}]
+                res["subagent_justification"] = (
+                    f"Đã đo {verification['stats']['total_requests']} HTTP requests, "
+                    f"xác minh {len(verification['verified_parameters'])} tham số có ảnh hưởng phản hồi lặp lại; "
+                    f"{len(verification['parameter_candidates'])} ứng viên chưa đủ bằng chứng. "
+                    "Endpoint vẫn cần kiểm chứng Soft404 riêng."
+                )
+
             log_agent_success(
                 "ParamDiscoveryAgent",
                 f"Đã sinh tham số ứng viên cho {len(res['param_results'])} endpoints "
-                f"({res.get('assembled_parameter_count', 0)} tên được lắp ráp); chưa kiểm chứng HTTP.",
+                f"({res.get('assembled_parameter_count', 0)} tên được lắp ráp); "
+                f"HTTP verification={res['verification_status']}.",
                 metrics={
                     "analyzed_endpoints": len(res['param_results']),
                     "assembled_parameters": res.get("assembled_parameter_count", 0),
                 }
             )
 
-            return res
+            return redact(res)
         except Exception as e:
-            log_agent_error("ParamDiscoveryAgent", f"Thất bại khi tìm tham số ẩn trên {target_url}", exception=e)
-            raise e
+            safe_error = redact(f"{type(e).__name__}: {e}")
+            log_agent_error("ParamDiscoveryAgent", f"Thất bại khi tìm tham số ẩn: {safe_error}")
+            if res is None:
+                raise RuntimeError(safe_error) from None
+            # Candidate generation succeeded; keep it reviewable even when a
+            # verifier/configuration exception prevents HTTP evidence collection.
+            res.update(verification="not_checked", verification_performed=False,
+                       verification_status="failed", stop_reason="verification_failed",
+                       verified_parameters=[], parameter_candidates=[],
+                       stats={"total_requests": None}, error=safe_error)
+            for row in res.get("param_results", []):
+                for param in row.get("discovered_params", []):
+                    res["parameter_candidates"].append({
+                        "endpoint": row.get("url"), "name": param.get("name"),
+                        "location": param.get("location", "query"), "method": param.get("method", "GET"),
+                        "result_kind": "parameter_candidate", "verification": "not_checked",
+                        "verification_performed": False, "verification_reason": "verification_failed",
+                        "status_code": None, "content_length_change": None,
+                    })
+            return redact(res)

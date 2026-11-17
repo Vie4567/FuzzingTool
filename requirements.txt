@@ -1,5 +1,9 @@
-langchain>=0.3.0
-langchain-openai>=0.2.0
-langchain-core>=0.3.0
-langgraph>=0.2.0
-python-dotenv>=1.0.0
+# Tested runtime: CPython 3.12.10, Windows x64.
+# Constrain transitive dependencies as well as the direct requirements below.
+-c requirements.lock.txt
+
+langchain==1.4.6
+langchain-openai==1.7.2
+langchain-core==1.6.12
+langgraph==1.2.16
+python-dotenv==1.2.4

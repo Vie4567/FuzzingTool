@@ -14,14 +14,16 @@ import json
 import re
 import logging
 from datetime import datetime, timezone
+from itertools import islice
 from typing import Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from .state import SharedState
+from .state import SharedState, lifecycle_summary, error_count
 from .knowledge_store import KnowledgeStore
 from .llm_logging import invoke_logged, sanitize_for_log
+from .telemetry import sync_state
 from .prompts import (
     COORDINATOR_SYSTEM_PROMPT,
     DECISION_PROMPT_TEMPLATE,
@@ -30,6 +32,88 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_json(value, *, depth=0):
+    """Keep auxiliary historical knowledge bounded before putting it in prompts."""
+    remaining = 100
+    def bounded(item, level):
+        nonlocal remaining
+        if remaining <= 0:
+            return "[summary truncated]"
+        remaining -= 1
+        if isinstance(item, str):
+            return item[:240]
+        if item is None or type(item) in (bool, int, float):
+            return item
+        if level >= 4:
+            return "[summary truncated]"
+        if isinstance(item, dict):
+            result = {}
+            for key, val in islice(item.items(), 8):
+                if remaining <= 0:
+                    result["[truncated]"] = True
+                    break
+                result[key[:40] if isinstance(key, str) else "[non-string-key]"] = bounded(val, level + 1)
+            return result
+        if isinstance(item, list):
+            result = []
+            for val in islice(item, 5):
+                if remaining <= 0:
+                    result.append("[truncated]")
+                    break
+                result.append(bounded(val, level + 1))
+            return result
+        return "[unsupported value]"
+    rendered = json.dumps(bounded(value, depth), ensure_ascii=False)
+    if len(rendered) <= 4000:
+        return rendered
+    # Prefix is already JSON-escaped text; escaping it again is at most 2x.
+    return json.dumps({"summary_prefix": rendered[:1800], "truncated": True}, ensure_ascii=False)
+
+
+def _observed_facts(state):
+    """Finite allowlist of measured facts suitable for deterministic reflection."""
+    summary = lifecycle_summary(state)
+    facts = {key: summary[key] for key in (
+        "generated_count", "selected_count", "planned_requests", "attempted_requests",
+        "responses_received", "network_errors", "remaining_requests", "fuzzing_requests",
+        "healthcheck_requests", "proxy_connect_errors", "responses_received_lower_bound") if summary[key] is not None}
+    facts["errors_count"] = error_count(state)
+    for key in ("verified_results", "false_positives", "verified_parameters"):
+        if isinstance(state.get(key), list):
+            facts[key + "_count"] = len(state[key])
+    for agent in ("tech_recon", "wordlist_gen", "fuzzing", "param_disc", "soft404_filter"):
+        status = state.get("agent_statuses", {}).get(agent)
+        if status in {"pending", "running", "success", "partial", "failed", "skipped"}:
+            facts["agent_statuses." + agent] = status
+    return facts
+
+
+def _verified_observations(lessons, state):
+    """Never promote arbitrary model prose to an observed fact.
+
+    A matched typed scalar permits only a canonical session observation, not
+    the model's claimed cause, recommendation, confidence, applicability or ID.
+    """
+    facts, accepted, seen = _observed_facts(state), [], set()
+    for lesson in lessons[:20]:
+        evidence = lesson.get("evidence") if isinstance(lesson, dict) else None
+        if not isinstance(evidence, dict):
+            continue
+        key, value = evidence.get("fact"), evidence.get("value")
+        if (not isinstance(key, str) or key not in facts or key in seen
+                or type(value) is not type(facts[key]) or value != facts[key]):
+            continue
+        seen.add(key)
+        accepted.append({
+            "lesson": f"Observed in this session: {key} = {json.dumps(value, ensure_ascii=False)}. No causal explanation is established.",
+            "evidence": {"fact": key, "value": value},
+            "verification_status": "verified_observation", "kind": "session_observation",
+            "applicable_when": {"session_id": state.get("session_id", "")},
+            "source_sessions": [state.get("session_id", "")], "confidence": 1.0,
+        })
+    return accepted
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -196,7 +280,7 @@ class DecisionEngine:
         )
 
         # ── BƯỚC 1: Thu thập context ──
-        context = self._build_context(state, completed_agent)
+        # Lifecycle facts are derived in the actual prompt and audit snapshot.
 
         # ── BƯỚC 2: Truy xuất knowledge ──
         knowledge_context = self.knowledge.retrieve_knowledge({
@@ -234,6 +318,7 @@ class DecisionEngine:
             chain, template_vars, component="Coordinator", operation="decision",
             context={"decision_point": decision_point, "decision_id": decision_id},
         )
+        sync_state(state)
 
         # ── BƯỚC 4: Parse & Validate ──
         decision = self._parse_llm_decision(raw_response.content)
@@ -294,7 +379,6 @@ class DecisionEngine:
             ),
             "confidence": decision.get("confidence", 0.5),
         })
-        state["coordinator_llm_calls"] += 1
 
         logger.info(
             f"[Decision {decision_id}] {decision_point} → "
@@ -326,10 +410,10 @@ class DecisionEngine:
             Reflection dict (lessons_learned, decision_evaluations, ...)
         """
         reflection_vars = {
+            "lifecycle_summary": json.dumps(lifecycle_summary(state), ensure_ascii=False),
+            "observed_facts": json.dumps(_observed_facts(state), ensure_ascii=False),
             "target_url": state.get("target_url", ""),
-            "tech_stack": json.dumps(
-                state.get("tech_stack", {}), ensure_ascii=False
-            ),
+            "tech_stack": _bounded_json(state.get("tech_stack", {})),
             "waf_info": (
                 f"Detected: {state['waf_type']}"
                 if state.get("waf_detected")
@@ -357,9 +441,9 @@ class DecisionEngine:
                         "action": d["action"],
                         "reasoning": d.get("reasoning", {}).get(
                             "analysis", ""
-                        ),
+                        )[:300],
                     }
-                    for d in state.get("decision_chain", [])
+                    for d in state.get("decision_chain", [])[-20:]
                 ],
                 ensure_ascii=False,
             ),
@@ -370,25 +454,33 @@ class DecisionEngine:
             chain, reflection_vars, component="Coordinator", operation="reflection",
             context={"session_id": state.get("session_id", "")},
         )
+        sync_state(state)
 
         reflection = self._parse_llm_decision(response.content)
+        if (not isinstance(reflection, dict)
+                or any(not isinstance(reflection.get(key), list)
+                       for key in ("lessons_learned", "decision_evaluations"))):
+            raise ValueError("Coordinator reflection requires lessons_learned and decision_evaluations lists")
 
         # Lưu lessons vào Knowledge Store
-        new_lessons = reflection.get("lessons_learned", [])
+        proposed = reflection.get("lessons_learned", [])
+        new_lessons = _verified_observations(proposed, state)
+        reflection["lessons_learned"] = new_lessons
+        reflection["lessons_rejected_count"] = len(proposed) - len(new_lessons)
         if new_lessons:
             self.knowledge.save_lessons(new_lessons)
 
         # Cập nhật decision outcomes
-        for eval_item in reflection.get("decision_evaluations", []):
+        for eval_item in reflection.get("decision_evaluations", [])[:20]:
+            if not isinstance(eval_item, dict):
+                continue
             for decision in state.get("decision_chain", []):
                 if decision["decision_id"] == eval_item.get("decision_id"):
                     decision["outcome"] = {
-                        "was_correct_decision": eval_item.get(
-                            "was_correct", True
-                        ),
-                        "retrospective_note": eval_item.get(
-                            "retrospective_note", ""
-                        ),
+                        "was_correct_decision": None,
+                        "verification_status": "unverified_model_assessment",
+                        "retrospective_note": sanitize_for_log({"credentials": state.get("config", {}),
+                            "value": str(eval_item.get("retrospective_note", ""))})["value"][:500],
                     }
 
         # Lưu session record vào Knowledge Store
@@ -400,13 +492,13 @@ class DecisionEngine:
             "type": "reflection",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "lessons_count": len(new_lessons),
+            "lessons_rejected_count": len(proposed) - len(new_lessons),
             "lessons_summary": [
                 l.get("lesson", "") for l in new_lessons
             ],
         })
 
         state["session_lessons"] = new_lessons
-        state["coordinator_llm_calls"] += 1
 
         logger.info(f"[Reflection] Rút ra {len(new_lessons)} bài học mới")
         for lesson in new_lessons:
@@ -421,6 +513,7 @@ class DecisionEngine:
     def _build_context(self, state: dict, agent: str) -> dict:
         """Xây dựng context dict cho LLM."""
         return {
+            "lifecycle": lifecycle_summary(state),
             "tech_stack": state.get("tech_stack", {}),
             "waf_detected": state.get("waf_detected", False),
             "waf_type": state.get("waf_type"),
@@ -437,12 +530,13 @@ class DecisionEngine:
             "param_results_count": len(state.get("param_results", [])),
             "verified_count": len(state.get("verified_results", [])),
             "llm_calls_used": state.get("llm_call_count", 0),
-            "errors_count": len(state.get("error_log", [])),
+            "errors_count": error_count(state),
         }
 
     def _snapshot_state(self, state: dict) -> dict:
         """Tạo snapshot nhẹ của state cho audit log."""
         return {
+            "lifecycle": lifecycle_summary(state),
             "tech_stack": state.get("tech_stack", {}),
             "waf_detected": state.get("waf_detected", False),
             "waf_type": state.get("waf_type"),
@@ -461,8 +555,8 @@ class DecisionEngine:
                 state.get("verified_results", [])
             ),
             "llm_calls_used": state.get("llm_call_count", 0),
-            "llm_calls_remaining": 50 - state.get("llm_call_count", 0),
-            "errors_so_far": len(state.get("error_log", [])),
+            "llm_calls_remaining": max(0, state.get("config", {}).get("max_llm_calls", 50) - state.get("llm_call_count", 0)),
+            "errors_so_far": error_count(state),
         }
 
     def _extract_characteristics(self, state: dict) -> list:
@@ -496,15 +590,14 @@ class DecisionEngine:
     ) -> dict:
         """Build template variables cho decision prompt."""
         return {
+            "lifecycle_summary": json.dumps(lifecycle_summary(state), ensure_ascii=False),
             "completed_agent_name": completed_agent,
             "agent_status": agent_status,
-            "agent_result_summary": result_summary,
+            "agent_result_summary": str(result_summary)[:1200],
             "execution_time": exec_time,
             "error_details_if_failed": "",
             "target_url": state.get("target_url", ""),
-            "tech_stack_json": json.dumps(
-                state.get("tech_stack", {}), ensure_ascii=False
-            ),
+            "tech_stack_json": _bounded_json(state.get("tech_stack", {})),
             "waf_detected": state.get("waf_detected", False),
             "waf_type": state.get("waf_type", "None"),
             "discovered_paths_count": len(
@@ -521,27 +614,18 @@ class DecisionEngine:
             "verified_results_count": len(
                 state.get("verified_results", [])
             ),
-            "error_count": len(state.get("error_log", [])),
+            "error_count": error_count(state),
             "llm_calls_used": state.get("llm_call_count", 0),
-            "llm_calls_max": 50,
-            "llm_calls_remaining": 50 - state.get("llm_call_count", 0),
+            "llm_calls_max": state.get("config", {}).get("max_llm_calls", 50),
+            "llm_calls_remaining": max(0, state.get("config", {}).get("max_llm_calls", 50) - state.get("llm_call_count", 0)),
             "total_http_requests": state.get("total_http_requests", 0),
             "elapsed_seconds": 0,
             "circuit_breaker_states": json.dumps(
                 state.get("circuit_breaker_state", {})
             ),
-            "similar_sessions_summary": json.dumps(
-                knowledge.get("similar_sessions", []),
-                ensure_ascii=False,
-            ),
-            "relevant_lessons": json.dumps(
-                knowledge.get("relevant_lessons", []),
-                ensure_ascii=False,
-            ),
-            "relevant_patterns": json.dumps(
-                knowledge.get("relevant_patterns", []),
-                ensure_ascii=False,
-            ),
+            "similar_sessions_summary": _bounded_json(knowledge.get("similar_sessions", [])),
+            "relevant_lessons": _bounded_json(knowledge.get("relevant_lessons", [])),
+            "relevant_patterns": _bounded_json(knowledge.get("relevant_patterns", [])),
             "available_actions_list": json.dumps(
                 actions, ensure_ascii=False
             ),
@@ -553,20 +637,16 @@ class DecisionEngine:
         """Build template variables cho error decision prompt."""
         return {
             "failed_agent_name": agent,
-            "error_message": error,
+            "error_message": sanitize_for_log({"credentials": state.get("config", {}),
+                                                "value": str(error)})["value"][:1200],
             "error_type": "unknown",
             "retry_count": state.get("retry_counts", {}).get(agent, 0),
-            "max_retries": 3,
+            "max_retries": state.get("config", {}).get("max_retries", 2),
             "next_retry_count": (
                 state.get("retry_counts", {}).get(agent, 0) + 1
             ),
-            "state_snapshot_at_error": json.dumps(
-                self._snapshot_state(state), ensure_ascii=False
-            ),
-            "similar_error_knowledge": json.dumps(
-                knowledge.get("relevant_lessons", []),
-                ensure_ascii=False,
-            ),
+            "state_snapshot_at_error": _bounded_json(self._snapshot_state(state)),
+            "similar_error_knowledge": _bounded_json(knowledge.get("relevant_lessons", [])),
         }
 
     def _parse_llm_decision(self, raw: str) -> dict:
@@ -621,8 +701,8 @@ class DecisionEngine:
 
         Checks:
             1. Action phải nằm trong danh sách allowed
-            2. Retry count không vượt max (3)
-            3. LLM quota chưa hết (50)
+            2. Retry count không vượt max_retries đã cấu hình
+            3. LLM quota chưa hết max_llm_calls đã cấu hình
         """
         action = decision.get("action", "")
         available = [
@@ -651,14 +731,16 @@ class DecisionEngine:
         # Check 2: Retry count
         if "retry" in decision.get("action", ""):
             # Lấy agent từ context
-            for agent_name in state.get("retry_counts", {}):
+            retry_agent = {"retry_recon": "tech_recon", "retry_wordlist": "wordlist_gen", "retry_fuzzing": "fuzzing"}.get(decision.get("action"))
+            for agent_name in [retry_agent] if retry_agent else []:
                 retries = state["retry_counts"].get(agent_name, 0)
-                if retries >= 3:
+                if retries >= state.get("config", {}).get("max_retries", 2):
                     logger.warning(
                         f"[Guard] LLM wants retry but {agent_name} "
                         f"already retried {retries} times — forcing abort"
                     )
                     decision["action"] = "abort_to_report"
+                    state["stop_reason"] = "max_retries"
                     state["audit_log"].append({
                         "type": "guard_rail_override",
                         "timestamp": datetime.now(
@@ -673,7 +755,7 @@ class DecisionEngine:
                     break
 
         # Check 3: LLM quota
-        if state.get("llm_call_count", 0) >= 50:
+        if state.get("llm_call_count", 0) >= state.get("config", {}).get("max_llm_calls", 50):
             current_action = decision.get("action", "")
             if current_action not in (
                 "abort_to_report",
@@ -684,6 +766,7 @@ class DecisionEngine:
                     "[Guard] LLM quota exhausted — forcing report"
                 )
                 decision["action"] = "abort_to_report"
+                state["stop_reason"] = "max_llm_calls"
                 state["audit_log"].append({
                     "type": "guard_rail_override",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -724,6 +807,7 @@ class DecisionEngine:
                 for d in state.get("decision_chain", [])
             ],
             "outcomes": {
+                "lifecycle": lifecycle_summary(state),
                 "total_verified_results": len(
                     state.get("verified_results", [])
                 ),
@@ -748,9 +832,7 @@ class DecisionEngine:
                     ).items()
                     if v == "skipped"
                 ],
-                "errors_encountered": len(
-                    state.get("error_log", [])
-                ),
+                "errors_encountered": error_count(state),
             },
             "lessons_learned": lessons,
         }
