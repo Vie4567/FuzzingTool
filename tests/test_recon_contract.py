@@ -103,6 +103,40 @@ class ReconContractTests(unittest.TestCase):
         self.assertEqual(state["recon_execution"]["stats"]["responses_received"], 1)
         self.assertNotIn(secret, json.dumps({k: v for k, v in state.items() if k != "config"}))
 
+    def test_operator_config_does_not_redact_public_recon_evidence(self):
+        secret = "opaque-recon-contract-fixture-7138"
+        provider_secret = "opaque-provider-fixture-1942"
+        proxy_password = "fixture-proxy-pass-9371"
+        proxy_url = "http://fixture-proxy-user:" + proxy_password + "@127.0.0.1:3128"
+        output = fixture_result()
+        output["execution"]["requests"] = [{"url": TARGET, "method": "GET", "status_code": 200}]
+        output["subagent_justification"] = "echo " + " ".join((secret, provider_secret, proxy_url, proxy_password))
+        original = deepcopy(output)
+        state = self.state()
+        state["config"] = {
+            "headers": {"Authorization": "Bearer " + secret}, "api_key": provider_secret,
+            "allowed_origins": ["https://catalog.example.invalid"],
+            "auth_origins": ["https://catalog.example.invalid"],
+            "wordlist": ["/app/items"], "llm_model": "React",
+            "fuzzing_options": {"engine": "python_http", "http_method": "GET", "proxy": proxy_url},
+        }
+        with patch.object(graph.TechReconAgent, "execute", return_value=output):
+            graph.run_tech_recon(state)
+        self.assertEqual(state["recon_execution"]["requests"], output["execution"]["requests"])
+        self.assertEqual(state["recon_profile"], output["recon_profile"])
+        self.assertEqual(state["discovered_paths"], ["/app/items"])
+        with patch.object(graph.WordlistGenAgent, "execute", return_value={"wordlist": ["/app/items"]}) as wordlist:
+            graph.run_wordlist_gen(state)
+        self.assertEqual(wordlist.call_args.kwargs["recon_profile"], output["recon_profile"])
+        from src.coordinator.artifacts import RunArtifacts
+        saved = RunArtifacts({**state["config"], "artifact_root": str(self.temp)}).save(state)
+        self.assertEqual(saved["recon_execution"]["requests"], output["execution"]["requests"])
+        for value in (saved, wordlist.call_args.kwargs,
+                      {k: v for k, v in state.items() if k != "config"}):
+            for token in (secret, provider_secret, proxy_url, proxy_password):
+                self.assertNotIn(token, json.dumps(value))
+        self.assertEqual(output, original)
+
     def test_error_summaries_are_idempotent_per_attempt_and_preserve_retries(self):
         state = self.state()
         state["agent_attempts"] = {"tech_recon": 1}

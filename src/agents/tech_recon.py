@@ -129,37 +129,12 @@ THIRD_PARTY_IGNORE = {
 
 
 def _ch3_js_analyze(js_body: str, js_patterns: dict, base_domain: str = "", *, base_url=None, source_url=None) -> dict:
-    # Keep the complete source URL; absolute external paths are never reassigned
-    # to the target origin. This remains candidate extraction, not verification.
+    # Preserve the legacy return shape, but never fold dynamic expressions or
+    # classify arbitrary external links as API origins.
+    from src.tools.recon_discovery import extract_javascript
     base_url = base_url or ("https://" + base_domain + "/" if base_domain else "https://unknown.invalid/")
-    observations, parameters = [], []
-    candidates = []
-    for category, data in js_patterns.items():
-        if category == "_meta" or not isinstance(data, dict):
-            continue
-        for pattern in data.get("patterns", []):
-            try:
-                for match in re.finditer(pattern, js_body):
-                    value = match.group(1) if match.lastindex else match.group(0).strip("\"'")
-                    if value.startswith(("/", "http://", "https://")):
-                        candidates.append(value)
-            except re.error:
-                continue
-    # Quoted URLs retain query parameters lost by older path-only regexes.
-    candidates.extend(re.findall(r"[\"']((?:https?://|/)[^\"'<>\s]+)[\"']", js_body))
-    for value in candidates:
-        row = path_observation(value, base_url, "javascript")
-        if row:
-            row["source_url"] = source_url or base_url
-            observations.append(row)
-            parameters.extend(query_parameters(row["url"], "javascript", source_url or base_url))
-    observations = unique_records(observations)
-    api_origins = sorted({row["origin"] for row in observations
-                          if _origin(row["url"]) != _origin(base_url)})
-    return {"paths": target_paths(observations, base_url),
-            "params": sorted({row["name"] for row in parameters}),
-            "api_origins": api_origins, "observations": observations,
-            "parameters": unique_records(parameters)}
+    return extract_javascript(js_body, base_url, source_url or base_url)
+
 
 
 
@@ -418,6 +393,7 @@ async def _ch5_probe(base_url: str, *, transport=None) -> dict:
 # ===========================================================================
 
 async def _ch6_api_schema(schema_urls: list[str], *, transport=None) -> dict:
+    from src.tools.recon_discovery import annotate, content_id
     result = {"paths": [], "params": [], "schema_type": None, "endpoints_count": 0,
               "schema_source": None, "observations": [], "parameters": [], "operations": [],
               "unsupported": []}
@@ -434,6 +410,7 @@ async def _ch6_api_schema(schema_urls: list[str], *, transport=None) -> dict:
             continue
         try:
             schema = json.loads(body)
+            schema_digest = content_id(body)
             if not isinstance(schema, dict) or not isinstance(schema.get("paths"), dict):
                 raise ValueError("OpenAPI paths must be an object")
             if not (schema.get("openapi") or schema.get("swagger")):
@@ -461,6 +438,9 @@ async def _ch6_api_schema(schema_urls: list[str], *, transport=None) -> dict:
                     if not row:
                         continue
                     row["source_url"] = schema_url
+                    pointer = "/paths/" + path.replace("~", "~0").replace("/", "~1") + "/" + method.lower()
+                    annotate(row, source_type="openapi", source_url=schema_url, digest=schema_digest,
+                             location={"json_pointer": pointer}, hint="openapi")
                     result["observations"].append(row)
                     result["operations"].append({**row, "operation_id": operation.get("operationId"),
                                                  "request_body": operation.get("requestBody", {})})
@@ -471,7 +451,8 @@ async def _ch6_api_schema(schema_urls: list[str], *, transport=None) -> dict:
                         if isinstance(param, dict) and isinstance(param.get("name"), str):
                             result["parameters"].append({"name": param["name"], "location": param.get("in", "unknown"),
                                 "url": row["url"], "method": method.upper(), "source": "openapi", "source_url": schema_url,
-                                "classification": "observed", "required": param.get("required", False)})
+                                "classification": "observed", "required": param.get("required", False),
+                                "evidence_refs": row["evidence_refs"], "evidence_location": row["evidence_location"]})
             result["schema_type"], result["schema_source"] = "OpenAPI", schema_url
         except (ValueError, TypeError, AttributeError) as exc:
             if hasattr(transport, "error"):
@@ -672,6 +653,123 @@ class TechReconAgent(BaseAutonomousAgent):
         """Helper nội bộ chạy 7 kênh recon."""
         return asyncio.run(self._run_async(target_url))
 
+    def collect_discovery(self, target_url, resources, *, transport):
+        """B2.1 deterministic document collection through the B1 scope adapter.
+
+        Only the explicit plan is fetched, once per URL. Extracted links/forms,
+        JS calls and schema operations are context, never a request queue.
+        This entry point performs no LLM call and does not enable the pipeline.
+        """
+        from src.coordinator.origins import public_url
+        from src.coordinator.runtime import current_runtime
+        from src.tools.origin_scope import OriginScopedTransport
+        if not isinstance(transport, OriginScopedTransport) or current_runtime() is None:
+            raise ValueError("Discovery requires the B1 transport and an existing shared runtime")
+        target_url = public_url(target_url)
+        if not isinstance(resources, list) or not 1 <= len(resources) <= 64:
+            raise ValueError("Discovery requires 1..64 explicitly planned documents")
+        plan, seen = [], {}
+        for resource in resources:
+            if not isinstance(resource, dict) or set(resource) - {"url", "kind", "document_url"}:
+                raise ValueError("Invalid discovery resource")
+            url, kind = public_url(resource.get("url")), resource.get("kind")
+            if kind not in {"html", "javascript", "openapi"}:
+                raise ValueError("Unsupported discovery document kind")
+            base = public_url(resource.get("document_url", target_url))
+            transport._policy.check(url, "GET")
+            item = {"url": url, "kind": kind, "document_url": base}
+            if url in seen:
+                if seen[url] != item:
+                    raise ValueError("Conflicting discovery resource declarations")
+                continue
+            seen[url] = item
+            plan.append(item)
+        self._load_knowledge()
+        return asyncio.run(self._collect_discovery_async(target_url, plan, transport))
+
+    async def _collect_discovery_async(self, target_url, plan, transport):
+        from src.tools.recon_discovery import content_id
+        from src.coordinator.origins import public_url
+        records = ReconRecords(transport)
+        context = {"schema_version": 1, "observations": [], "parameters": [], "forms": [],
+                   "source_documents": [], "unresolved_references": []}
+        tech = {"frontend": "Unknown", "backend": "Unknown", "cms": "Unknown", "language": "Unknown"}
+        for resource in plan:
+            url, kind = resource["url"], resource["kind"]
+            channel = {"html": "CH-2 DOM", "javascript": "CH-3 JS", "openapi": "CH-6 Schema"}[kind]
+            if not records.start(channel):
+                break
+            measured = await asyncio.to_thread(transport.fetch_result, url, timeout=10, method="GET")
+            records.observe(channel, measured)
+            document = {"url": url, "origin": origin_url(url), "kind": kind, "method": "GET",
+                        "status_code": measured["status_code"], "attempted": measured["attempted"],
+                        "body_complete": measured["body_complete"], "source_sha256": None,
+                        "collection_status": "failed", "verification_status": "not_verified"}
+            context["source_documents"].append(document)
+            try:
+                if measured["status_code"] != 200 or not measured["body_complete"]:
+                    if measured["error"] is None and not records.stopped():
+                        records.error(channel, "document_unavailable", "Planned document was not a complete HTTP 200", url=url)
+                    continue
+                body = measured["body"]
+                document["source_sha256"] = content_id(body)
+                errors_before = len(records.errors)
+                if kind == "html":
+                    # Same DOM/form extraction used by the existing crawler.
+                    parsed = _ch2_dom_parse(body, url, self._fp_data)
+                    if url == target_url:
+                        tech = _ch1_header_fingerprint(measured["headers"], body, self._fp_data, self._waf_data)["tech_stack"]
+                elif kind == "javascript":
+                    parsed = _ch3_js_analyze(body, self._js_patterns, base_url=resource["document_url"], source_url=url)
+                else:
+                    # Reuse CH-6 on the already measured response, not a second GET.
+                    class DocumentView:
+                        def fetch(self, requested_url, timeout=10, method="GET"):
+                            if requested_url != url or method != "GET":
+                                raise ValueError("Document parser requested uncollected input")
+                            return measured["status_code"], measured["headers"], body
+                        def error(self, error_type, message, **details):
+                            records.error(channel, error_type, message, **details)
+                    parsed = await _ch6_api_schema([url], transport=DocumentView())
+                    if not parsed["schema_type"] and len(records.errors) == errors_before:
+                        records.error(channel, "unsupported_schema", "No supported OpenAPI JSON document parsed", url=url)
+                for error in parsed.get("errors", []):
+                    records.error(channel, error["error_type"], error["message"])
+                for key in ("observations", "parameters", "forms", "unresolved_references"):
+                    context[key].extend(parsed.get(key, []))
+                document["collection_status"] = "completed" if len(records.errors) == errors_before else "partial"
+            except Exception as exc:
+                records.error(channel, "discovery_parse_error", type(exc).__name__, url=url)
+            finally:
+                records.finish(channel)
+        rejected = 0
+        for key in ("observations", "parameters", "forms", "unresolved_references"):
+            retained = []
+            for row in unique_records(context[key]):
+                try:
+                    for name in ("url", "action", "source_url"):
+                        if row.get(name) is not None:
+                            public_url(row[name])
+                    if self._redact(row, transport) != row:
+                        raise ValueError("Sensitive discovery metadata")
+                    retained.append(row)
+                except (ValueError, TypeError):
+                    rejected += 1
+            context[key] = retained
+        # A redacted URL must never become a new executable candidate URL.
+        context["rejected_sensitive_records"] = rejected
+        execution = records.execution()
+        profile = {"schema_version": 1, "target_url": target_url, "tech_stack": tech,
+                   "paths": context["observations"], "parameters": context["parameters"],
+                   "forms": context["forms"], "unresolved_references": context["unresolved_references"],
+                   "api_context": {"classification": "candidate"}, "architecture": {"type": "Unknown"}}
+        result = {"target_url": target_url, "tech_stack": tech,
+                  "discovered_paths": target_paths(context["observations"], target_url),
+                  "recon_profile": profile, "discovery_context": context, "execution": execution,
+                  "http_policy": transport.public_settings(), "collection_mode": "explicit_document_plan",
+                  "planned_documents": len(plan), "unprocessed_documents": len(plan) - len(context["source_documents"])}
+        return self._redact(result, transport)
+
     def _load_knowledge(self):
         if self._loaded:
             return
@@ -718,7 +816,7 @@ class TechReconAgent(BaseAutonomousAgent):
             (None, {}, ""))
         ch1 = _ch1_header_fingerprint(headers, body, self._fp_data, self._waf_data)
         ch2 = {**empty(), "forms": [], "cms_hints": [], "meta_generator": None, "script_urls": []}
-        ch3 = {**empty(), "api_origins": [], "files_selected": 0, "files_analyzed": 0}
+        ch3 = {**empty(), "api_origins": [], "files_selected": 0, "files_analyzed": 0, "unresolved_references": []}
         ch4 = {**empty(), "forms": [], "pages_visited": 0, "pages_selected": 0, "depth_used": 0}
         ch5 = {**empty(), "has_robots_txt": False, "has_sitemap": False, "probe_hits": [], "api_schema_urls": []}
         ch6 = {**empty(), "schema_type": None, "schema_source": None, "endpoints_count": 0,
@@ -735,7 +833,7 @@ class TechReconAgent(BaseAutonomousAgent):
             records.finish("CH-2 DOM")
 
             async def collect_js():
-                data = {**empty(), "api_origins": [], "files_selected": 0, "files_analyzed": 0}
+                data = {**empty(), "api_origins": [], "files_selected": 0, "files_analyzed": 0, "unresolved_references": []}
                 js_urls = [url for url in ch2.get("script_urls", [])
                            if urllib.parse.urlsplit(url).path.endswith(".js")][:20]
                 data["files_selected"] = len(js_urls)
@@ -749,7 +847,7 @@ class TechReconAgent(BaseAutonomousAgent):
                             continue
                         observed = _ch3_js_analyze(content, self._js_patterns, base_url=target_url, source_url=url)
                         data["files_analyzed"] += 1
-                        for key in ("observations", "parameters", "api_origins"):
+                        for key in ("observations", "parameters", "api_origins", "unresolved_references"):
                             data[key].extend(observed.get(key, []))
                 data["observations"] = unique_records(data["observations"])
                 data["parameters"] = unique_records(data["parameters"])
@@ -821,6 +919,7 @@ class TechReconAgent(BaseAutonomousAgent):
                        "backend_origins": [{"origin": host, "classification": "candidate", "source": "javascript"} for host in api_hosts],
                        "backend_paths": api_paths, "path_classification": "inferred"}
         profile = {"schema_version": 1, "target_url": target_url, "tech_stack": final_tech,
+                   "unresolved_references": ch3.get("unresolved_references", []),
                    "technology_evidence": evidence, "technology_conflicts": conflicts,
                    "architecture": architecture, "paths": observations, "parameters": parameters,
                    "forms": forms, "api_context": api_context,

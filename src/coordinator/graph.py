@@ -31,7 +31,7 @@ from .knowledge_store import KnowledgeStore
 from .logger import log_decision, log_agent_skip, log_pipeline_summary
 from .llm_logging import sanitize_for_log
 from .telemetry import telemetry_session, telemetry_phase, sync_state, current_telemetry
-from .artifacts import RunArtifacts, ArtifactWriteError
+from .artifacts import RunArtifacts, ArtifactWriteError, _secrets
 from .validation import validate_pipeline_input, validate_wordlist, InputValidationError
 from .runtime import runtime_session, current_runtime, check_deadline, snapshot as runtime_snapshot
 from ..tools.recon_http import recon_options_from_config
@@ -324,6 +324,13 @@ def validate_input(state: dict) -> dict:
             url, config = validate_pipeline_input(url, state.get("config"))
         state["target_url"], state["config"] = url, config
         state["input_wordlist"] = config.get("wordlist", [])
+        # B1 adds a public contract without enabling unguarded Agent dispatch.
+        # Exact multi-origin policy is not wired through every engine until B3.
+        if "multi_origin" in config:
+            from .origins import origin_state
+            state.update(origin_state(url, config["multi_origin"]))
+            state["stop_reason"] = "multi_origin_execution_not_enabled_b1"
+            raise InputValidationError("multi_origin execution is unavailable until all dispatch guards are integrated (B3)")
     except (InputValidationError, TypeError, ValueError) as exc:
         state["agent_statuses"]["validate"] = "failed"
         state["audit_log"].append({
@@ -433,7 +440,10 @@ def run_tech_recon(state: dict) -> dict:
                                **recon_options_from_config(state.get("config")))
         result = agent.execute(state["target_url"])
         _output(result, {"tech_stack": dict, "discovered_paths": list}, "Recon")
-        result = sanitize_for_log({"credentials": state.get("config", {}), "value": result})["value"]
+        # Collect credential fields from config, not every configuration string.
+        # Treating the whole config as credentials also erased public origins,
+        # HTTP methods and seed paths from Recon evidence and Agent 2 context.
+        result = sanitize_for_log({"credentials": _secrets(state.get("config", {})), "value": result})["value"]
         execution = _recon_execution(result)
         previous = state.get("recon_execution", {})
         responses = execution.get("stats", {}).get("responses_received")
@@ -448,6 +458,9 @@ def run_tech_recon(state: dict) -> dict:
             state["waf_type"] = result.get("waf_type", None)
         state["recon_http_policy"] = result.get("http_policy", {})
         profile = result.get("recon_profile")
+        if state.get("origin_contract_version") == 1 and result.get("discovery_context") is not None:
+            from .origins import merge_discovery_context
+            merge_discovery_context(state, result["discovery_context"])
         if profile is not None and not isinstance(profile, dict):
             raise ValueError("Recon profile must be an object")
         # Legacy fields remain available; the full structured evidence lives in
@@ -834,6 +847,27 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
     return state
 
 
+def _verification_execution_status(result):
+    """A returned payload is not proof that HTTP verification ran."""
+    declared = result.get("verification_status", "not_checked")
+    stop = result.get("stop_reason")
+    if declared in {"failed", "partial", "skipped"}:
+        return declared, declared, stop
+    count = (result.get("stats") or {}).get("total_requests")
+    measured = result.get("verification_performed") is True and type(count) is int and count > 0
+    if declared == "completed" and measured:
+        if stop not in (None, "", "completed"):
+            return "partial", "partial", stop
+        return "success", declared, stop
+    if measured:
+        return "partial", "partial", stop or "verification_status_unrecognized"
+    # Preserve legacy/unreported declarations for consumers, but never promote
+    # them to success. An explicit completed-without-measurements is skipped.
+    return "skipped", "skipped" if declared == "completed" else declared, (
+        stop if stop not in (None, "", "completed") else "verification_not_performed"
+    )
+
+
 @_checkpointed
 def run_param_discovery(state: dict) -> dict:
     """Node: Agent 4 — Parameter Discovery."""
@@ -868,18 +902,16 @@ def run_param_discovery(state: dict) -> dict:
         state["parameter_candidates"] = result.get("parameter_candidates", [])
         state["verified_parameters"] = result.get("verified_parameters", [])
         state["parameter_stats"] = result.get("stats", {})
-        state["parameter_verification_status"] = result.get("verification_status", "not_checked")
-        state["parameter_stop_reason"] = result.get("stop_reason")
+        agent_status, verification_status, stop_reason = _verification_execution_status(result)
+        state["parameter_verification_status"] = verification_status
+        state["parameter_stop_reason"] = stop_reason
         state["parameter_http_policy"] = result.get("http_policy", {})
         state.setdefault("subagent_justifications", {})["param_disc"] = result.get("subagent_justification", "")
         count = result.get("stats", {}).get("total_requests", 0)
         previous = state.get("total_http_requests")
         state["total_http_requests"] = previous + count if isinstance(previous, int) and isinstance(count, int) else None
         status = state["parameter_verification_status"]
-        state["agent_statuses"]["param_disc"] = (
-            "failed" if status == "failed" else "partial" if status == "partial"
-            else "skipped" if status == "skipped" else "success"
-        )
+        state["agent_statuses"]["param_disc"] = agent_status
         if status == "failed":
             state["error_log"].append({
                 "timestamp": datetime.now(timezone.utc).isoformat(), "agent": "param_disc",
@@ -887,11 +919,11 @@ def run_param_discovery(state: dict) -> dict:
                                            "value": result.get("error", "Parameter verification failed")})["value"],
             })
             circuit_breakers["param_disc"].record_failure()
-        elif status == "completed":
+        elif agent_status == "success":
             circuit_breakers["param_disc"].record_success()
 
         logger.info(
-            f"[ParamDisc] Success — "
+            f"[ParamDisc] {agent_status} — "
             f"{len(state['verified_parameters'])} verified, "
             f"{len(state['parameter_candidates'])} candidates"
         )
@@ -954,22 +986,27 @@ def run_soft404_filter(state: dict) -> dict:
 
         state["verified_results"] = result.get("verified", [])
         state["unverified_results"] = result.get("unverified", [])
-        state["verification_status"] = result.get("verification_status", "completed")
+        agent_status, verification_status, stop_reason = _verification_execution_status(result)
+        state["verification_status"] = verification_status
         state["false_positives"] = result.get("false_positives", [])
         state["baseline_signature"] = result.get("baseline")
         state["soft404_stats"] = result.get("stats", {})
-        state["soft404_stop_reason"] = result.get("stop_reason")
+        state["soft404_stop_reason"] = stop_reason
         state["soft404_signals"] = result.get("equal_length_signals", [])
         state.setdefault("subagent_justifications", {})["soft404"] = result.get("subagent_justification", "")
         request_count = result.get("stats", {}).get("total_requests", 0)
         previous_count = state.get("total_http_requests")
         if isinstance(previous_count, int) and isinstance(request_count, int):
             state["total_http_requests"] = previous_count + request_count
-        state["agent_statuses"]["soft404_filter"] = (
-            "skipped" if result.get("verification_performed") is False
-            else "partial" if result.get("verification_status") == "partial" else "success"
-        )
-        if state["agent_statuses"]["soft404_filter"] == "success":
+        state["agent_statuses"]["soft404_filter"] = agent_status
+        if agent_status == "failed":
+            state["error_log"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(), "agent": "soft404_filter",
+                "error": sanitize_for_log({"credentials": _secrets(state.get("config", {})),
+                                           "value": result.get("error", "Soft404 verification failed")})["value"],
+            })
+            circuit_breakers["soft404"].record_failure()
+        elif agent_status == "success":
             circuit_breakers["soft404"].record_success()
 
         logger.info(

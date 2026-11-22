@@ -108,6 +108,7 @@ _TOP = set(RECON_OPTION_KEYS) | {
     "max_wordlist_entries", "pipeline_timeout_seconds", "llm_timeout_seconds", "max_retries",
     "max_iterations", "max_llm_calls", "http_rate_limit", "http_max_requests",
     "http_timeout_seconds", "http_max_response_bytes", "run_all_modules", "llm_max_tokens",
+    "multi_origin",
 }
 _BOOLS = {"enabled", "auto_calibrate", "recursion", "follow_redirects", "follow_redirect",
           "stop_on_block", "stop_on_errors", "stop_on_all_errors", "stop_on_429",
@@ -216,6 +217,14 @@ def validate_pipeline_input(target_url, config=None):
     if not isinstance(config, dict) or any(not isinstance(k, str) for k in config) or set(config) - _TOP:
         _fail("config", "must be an object containing supported Coordinator options")
     c = deepcopy(config)
+    if "multi_origin" in c:
+        from .origins import normalize_origin_config, canonical_origin
+        try:
+            c["multi_origin"] = normalize_origin_config(c["multi_origin"])
+            if canonical_origin(target) not in c["multi_origin"]["approved_origins"]:
+                raise ValueError()
+        except (ValueError, TypeError):
+            _fail("multi_origin", "requires a public explicit origin policy including the primary target")
     defaults = {"pipeline_timeout_seconds": 600, "llm_timeout_seconds": 30, "max_retries": 2,
                 "max_iterations": 20, "max_llm_calls": 50, "http_rate_limit": 2,
                 "http_max_requests": 500, "http_timeout_seconds": 10,

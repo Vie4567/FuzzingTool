@@ -45,6 +45,23 @@ def read_settings():
     return {**dotenv_values(ROOT / ".env"), **os.environ}
 
 
+class RuntimePreflightError(RuntimeError):
+    pass
+
+
+def check_runtime():
+    """Import/compile the actual graph without invoking agents or providers."""
+    try:
+        from src.coordinator import build_coordinator_graph
+        build_coordinator_graph()
+    except (ImportError, OSError) as exc:
+        # Do not echo arbitrary import errors that may include private values.
+        raise RuntimePreflightError(
+            f"Coordinator runtime unavailable ({type(exc).__name__}). "
+            "Check dependencies and Windows Application Control; no requests were sent."
+        ) from None
+
+
 def build_config(args, settings, token, output):
     """Use Coordinator's validator; never serialize the private configuration."""
     from src.coordinator.validation import validate_pipeline_input, validate_url
@@ -116,6 +133,7 @@ def main(argv=None):
     )
     try:
         settings = read_settings()
+        check_runtime()
         # Local validation does not need, read or validate a real target token.
         token = "configuration-check-placeholder"
         if not args.check:
@@ -126,6 +144,9 @@ def main(argv=None):
         target, config = build_config(args, settings, token, output)
     except (EOFError, GetPassWarning):
         print("Use an interactive terminal that supports hidden token input.", flush=True)
+        return 2
+    except RuntimePreflightError as exc:
+        print(str(exc), flush=True)
         return 2
     except (ValueError, OSError) as exc:
         print(f"Configuration error: {exc}", flush=True)
@@ -139,7 +160,7 @@ def main(argv=None):
         print("Routes: Recon=direct; Fuzzing=rotating proxy_http; Parameter/Soft404=reused proxy pool, rotation per endpoint.", flush=True)
         print("Proxy availability and distinct public egress IPs have not been verified yet.", flush=True)
     if args.check:
-        print("Configuration valid. No target, proxy or LLM requests were sent; token acceptance is untested.", flush=True)
+        print("Configuration valid; Coordinator graph compiled. No target, proxy or LLM requests were sent; token acceptance is untested.", flush=True)
         return 0
     output.mkdir(parents=True, exist_ok=False)
     os.environ["LLM_RESPONSE_LOG_FILE"] = str(output / "llm_responses.jsonl")

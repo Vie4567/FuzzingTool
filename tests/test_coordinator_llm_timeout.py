@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import unittest
+from openai import APIStatusError
 
 from src.coordinator.llm_client import DeadlineChatOpenAI
 from src.coordinator.telemetry import telemetry_session, invoke_measured
@@ -14,8 +15,15 @@ from src.coordinator.runtime import runtime_session, PipelineStopped
 class SlowAPI(BaseHTTPRequestHandler):
     def do_POST(self):
         self.server.requests += 1
+        self.server.observed.append({'path': self.path, 'authorization': self.headers.get('Authorization')})
         incoming = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
         mode = incoming['messages'][-1]['content']
+        if mode == 'redirect' and self.path == '/v1/chat/completions' and self.server.redirect_to:
+            self.send_response(307)
+            self.send_header('Location', self.server.redirect_to)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         payload = json.dumps({'id': 'fixture', 'object': 'chat.completion',
             'created': 1, 'model': 'fixture', 'choices': [{'index': 0,
                 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]}).encode()
@@ -46,6 +54,8 @@ class SlowAPI(BaseHTTPRequestHandler):
 def local_api(timeout=.6):
     server = ThreadingHTTPServer(('127.0.0.1', 0), SlowAPI)
     server.requests = 0
+    server.observed = []
+    server.redirect_to = None
     server.disconnected = threading.Event()
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -60,6 +70,26 @@ def local_api(timeout=.6):
 
 
 class LLMTimeoutTests(unittest.TestCase):
+    def test_provider_redirect_does_not_replay_prompt_or_credentials(self):
+        with local_api(timeout=2) as (first, model), local_api(timeout=2) as (other, _):
+            for destination in ('/redirected', f'http://127.0.0.1:{other.server_port}/redirected'):
+                with self.subTest(destination=destination):
+                    first.redirect_to = destination
+                    first.requests = other.requests = 0
+                    first.observed.clear()
+                    other.observed.clear()
+                    with telemetry_session() as telemetry:
+                        with self.assertRaises(APIStatusError) as caught:
+                            invoke_measured(model, 'redirect', component='Coordinator')
+                        self.assertEqual(caught.exception.status_code, 307)
+                        self.assertEqual(telemetry.snapshot()['llm']['attempted'], 1)
+                        self.assertEqual(telemetry.snapshot()['llm']['failed'], 1)
+                    self.assertEqual(first.requests, 1)
+                    self.assertEqual(first.observed, [{'path': '/v1/chat/completions',
+                                                      'authorization': 'Bearer fixture'}])
+                    self.assertEqual(other.requests, 0)
+                    self.assertEqual(other.observed, [])
+
     def test_token_limit_uses_provider_specific_field_without_network(self):
         for base, key in [('https://api.deepseek.com', 'max_tokens'),
                           ('https://api.openai.com/v1', 'max_completion_tokens')]:

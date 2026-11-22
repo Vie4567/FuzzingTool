@@ -170,7 +170,7 @@ else:
             self.assertEqual(result["agent_statuses"], {
                 "validate": "success", "tech_recon": "success",
                 "wordlist_gen": "success", "fuzzing": "success",
-                "param_disc": "success", "soft404_filter": "skipped",
+                "param_disc": "skipped", "soft404_filter": "skipped",
             })
             self.assertEqual(result["wordlist"], ["/fixture"])
             self.assertEqual(result["raw_results"], [sample_response])

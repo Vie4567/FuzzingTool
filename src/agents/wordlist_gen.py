@@ -148,6 +148,21 @@ class WordlistGenAgent(BaseAutonomousAgent):
     # LLM ANALYSIS: 8 CHIEU THOI QUEN LAP TRINH VIEN (DEVELOPER PROFILING)
     # ==========================================================================
 
+    def generate_from_discovery(self, shared_state: dict, *, max_wordlist_entries=6,
+                                max_generated_per_origin=32, allow_generic=False,
+                                artifact_root=None) -> dict:
+        """B2.2 offline generation over B2.1 contexts; no LLM/HTTP dispatch.
+
+        The legacy execute() contract is unchanged. This additive entry point
+        does not flatten origins into the single-target pipeline wordlist or
+        enable multi-origin scheduling. Generated methods remain unknown.
+        """
+        from .origin_wordlist import generate
+        return generate(shared_state, profile_builder=self._build_heuristic_dev_profile,
+                        max_wordlist_entries=max_wordlist_entries,
+                        max_generated_per_origin=max_generated_per_origin,
+                        allow_generic=allow_generic, artifact_root=artifact_root)
+
     def _analyze_dev_profile_with_llm(
         self,
         tech_stack: dict,

@@ -214,12 +214,22 @@ class FuzzingIntegrationTests(unittest.TestCase):
     def test_explicit_options_override_plan_and_sensitive_values_are_redacted(self):
         agent = self.agent_for_payload({"engine": "python_http", "results": []})
         with patch.object(agent, "plan_tool_execution", return_value={
-            "selected_tool": "ffuf_fuzzing_tool", "options": {"rate_limit": 200, "delay_between_requests_ms": 300}
+            "selected_tool": "ffuf_fuzzing_tool", "options": {
+                "target_url": "https://model-target.invalid/FUZZ", "wordlist": ["/model-only"],
+                "rate_limit": 200, "delay_between_requests_ms": 300,
+                "timeout_seconds": 1, "max_requests": 999, "http_method": "POST",
+            }
         }), patch.object(agent.tool_registry, "execute_tool", wraps=agent.tool_registry.execute_tool) as execute:
             result = agent.execute(self.target, ["/ok"], use_pattern_engine=False, rate_limit=2,
+                                   timeout_seconds=8, max_requests=40, http_method="GET",
                                    headers={"Authorization": "Bearer fixture-secret"})
         sent = execute.call_args.args[1]
+        self.assertEqual(sent["target_url"], self.target)
+        self.assertEqual(sent["wordlist"], ["/ok"])
         self.assertEqual(sent["rate_limit"], 2)
+        self.assertEqual(sent["timeout_seconds"], 8)
+        self.assertEqual(sent["max_requests"], 40)
+        self.assertEqual(sent["http_method"], "GET")
         self.assertEqual(sent["delay_ms"], 300)
         self.assertEqual(sent["headers"]["Authorization"], "Bearer fixture-secret")
         self.assertNotIn("fixture-secret", str(result))

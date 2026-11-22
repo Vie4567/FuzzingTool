@@ -1,8 +1,8 @@
-# Kiểm tra trước nghiệm thu cab.vn — 2026-11-15
+# Kiểm tra trước nghiệm thu cab.vn — xác nhận lại 2026-11-20
 
 Phạm vi: đọc mã nguồn, kiểm tra cấu hình cục bộ và regression bằng fixtures/localhost/mock LLM. Không gọi cab.vn, không dùng access token thật, không gọi DeepSeek và không lấy proxy Internet. Chưa có bằng chứng nghiệm thu toàn bộ pipeline trên website thật trong lần kiểm tra này.
 
-Kết luận: có thể chuẩn bị một phiên có giám sát bằng `python_http` trực tiếp, khóa cùng target/auth origin. Chưa chứng nhận khả năng truy cập cab.vn, token/API key/model hợp lệ hoặc đủ dữ liệu để cả năm Agent hoàn tất. Những bảo đảm dưới đây áp dụng cho runner và cấu hình được hướng dẫn; không mở rộng kết luận cho mọi cấu hình API hoặc ffuf.
+Kết luận: mã nguồn có thể chuẩn bị một phiên có giám sát bằng `python_http` trực tiếp, khóa cùng target/auth origin; môi trường còn rủi ro chặn DLL phải theo dõi. Ngày 2026-11-20 đã tái hiện Windows Application Control chặn `ormsgpack.cp312-win_amd64.pyd` khi import Coordinator, với Code Integrity events 3077/3033. Những lần import sau thành công chưa chứng minh chính sách chặn đã được giải quyết. Chưa chứng nhận khả năng truy cập cab.vn, token/API key/model hợp lệ hoặc đủ dữ liệu để cả năm Agent hoàn tất. Những bảo đảm dưới đây áp dụng cho runner và cấu hình được hướng dẫn; không mở rộng kết luận cho mọi cấu hình API hoặc ffuf.
 
 ## Pipeline và dữ liệu
 
@@ -52,8 +52,29 @@ Không có refresh-token workflow: `AuthManager` hỗ trợ credentials cung c�
 
 1. `scripts/run_coordinator_scan.py::{parser,build_config,main}`: thêm `--proxy-source none` làm mặc định; không thêm proxy config ở direct; thêm HTTP budget/rate và retry CLI; `--check` không đọc token hoặc chạy pipeline. Nguyên nhân: runner cũ chỉ dùng proxy_http và tự chọn ProxyScrape.
 2. `src/tools/proxy_profiles.py::OPERATOR_NETWORK_OPTIONS`, `src/agents/fuzzer.py::execute`, `src/coordinator/graph.py::run_fuzzing`: chỉ cấu hình người chạy được chọn route/scope/TLS, loại fixed proxy và source/TLS options từ kế hoạch LLM ở cả hai tầng. Nguyên nhân: chặn proxy pool chưa bao phủ fixed proxy, Manager có thể đưa nó trở lại như caller option.
-3. Tests trong `tests/test_coordinator_scan_runner.py`, `tests/test_fuzzing_integration.py`, `tests/test_proxy_fuzzing.py`: direct mặc định, không đọc token khi check, cùng budget/rate, hidden token forwarding qua supervisor mock, LLM không được tự định tuyến, explicit operator route vẫn giữ.
-4. Hướng dẫn đã cập nhật tại [coordinator_auth_proxy_cli.md](coordinator_auth_proxy_cli.md). Không chỉnh `.env`, không thay kiến trúc/Agent, không commit/push.
+3. `src/agents/fuzzer.py::execute`: che credentials ở nhánh tool trả lỗi bình thường, lý do chọn tool, justification và chuỗi trong response trước khi trả kết quả/log/chuyển cho LLM. Nguyên nhân: nhánh exception đã sanitize nhưng `ToolResult.error_message` trả về bình thường có thể lọt vào info/warning log. Hai regression mới dùng opaque token giả để tái hiện; giữ status, byte length, thời gian, bộ đếm và response header không nhạy cảm, không sửa payload gốc của tool.
+4. Tests trong `tests/test_coordinator_scan_runner.py`, `tests/test_fuzzing_integration.py`, `tests/test_proxy_fuzzing.py`: direct mặc định, không đọc token khi check, cùng budget/rate, hidden token forwarding qua supervisor mock, LLM không được tự định tuyến, explicit operator route vẫn giữ và token phản chiếu không lọt vào log/justification.
+5. Hướng dẫn đã cập nhật tại [coordinator_auth_proxy_cli.md](coordinator_auth_proxy_cli.md). Không chỉnh `.env`, không thay kiến trúc/Agent, không commit/push. Khi tiếp tục ngày 2026-11-20, các bản vá trên đã có trong HEAD `cf22524`, nhánh `feature/fuzzingtool-integration`, worktree ban đầu sạch.
+6. Bổ sung lần xác nhận 2026-11-20: `scripts/run_coordinator_scan.py::check_runtime` import/compile graph thật trước khi hỏi token; thiếu/bị chặn DLL thì exit2, không chạy agent. `test_blocked_runtime_fails_before_token_prompt_or_pipeline` kiểm tra cả check/live với ImportError giả. Nguyên nhân: validation cấu hình trước đây vẫn có thể báo hợp lệ dù process worker không import được LangGraph. Không cài dependency, không thay chính sách Windows; preflight chỉ phát hiện lỗi tại thời điểm/process kiểm tra, không bảo đảm process worker tương lai không bị policy chặn.
+
+## Bằng chứng kiểm tra
+
+- Mốc trước bản vá redaction cuối: 468 tests PASS, 120,239 giây, log `output_samples/diagnostics/acceptance_readiness_20261115/tests.log`.
+- Lượt đầu xác nhận 2026-11-20: 461 test entries, **FAILED (1 import error)**, 130,552 giây; module gồm 10 tests Coordinator limits không được nạp do Windows chặn ormsgpack, không phải 461 tests đều PASS. Giữ log tại `output_samples/diagnostics/acceptance_readiness_20261120/tests_final.log`.
+- Module limits chạy riêng sau đó: 10/10 PASS. Test runner sau bổ sung preflight: 8/8 PASS. Không dùng hai kết quả riêng này để thay thế yêu cầu full regression.
+- Lượt full regression cuối sau bản vá preflight: **471/471 PASS**, 126,120 giây, log [tests_after_preflight.log](../output_samples/diagnostics/acceptance_readiness_20261120/tests_after_preflight.log). Các tests dùng fixtures/localhost/mock LLM; biến credential provider/target không được kế thừa vào process kiểm thử, dotenv/tracing tắt. Không chạy script lab hoặc quét website công khai.
+- Cần quản trị viên đánh giá DLL chính thức theo chính sách máy nếu lỗi chặn tái diễn; xem [coordinator_environment.md](coordinator_environment.md). Không dùng `pip check` hoặc `--check` thành công một lần để kết luận Windows sẽ luôn cho phép chạy.
+
+Lệnh regression:
+
+```powershell
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:LANGSMITH_TRACING = 'false'
+$env:LANGCHAIN_TRACING_V2 = 'false'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+```
+
+Trong lần kiểm chứng, stdout/stderr được lưu bằng UTF-8; cấu hình credentials thật trong môi trường process test được bỏ trước khi gọi lệnh này. Các kiểm chứng không tăng HTTP/LLM calls của phiên nghiệm thu: preflight chỉ import/compile, redaction chỉ xử lý dữ liệu đã có, sửa routing không thêm scan/retry. Không thay đổi giới hạn, TLS hoặc scope đã chọn.
 
 ## Cách chạy và tiêu chí nghiệm thu
 
@@ -63,7 +84,7 @@ Từ thư mục project, kiểm tra offline:
 .\.venv\Scripts\python.exe -B -u .\scripts\run_coordinator_scan.py --target https://cab.vn --proxy-source none --http-max-requests 200 --http-rate-limit 0.5 --max-wordlist-entries 6 --max-retries 0 --pipeline-timeout 1200 --llm-timeout 120 --check
 ```
 
-Lệnh này đã được kiểm tra cục bộ và trả `Configuration valid`, không dùng access token. Chỉ khi muốn thực hiện phiên thật, bỏ `--check` và nhập token ở prompt ẩn. Lượt thật sẽ gọi DeepSeek và gửi HTTP đến target; không được hiểu lệnh check là bằng chứng đã quét.
+Lệnh này đã được kiểm tra cục bộ và trả `Configuration valid; Coordinator graph compiled`, không dùng access token. Nếu báo `Coordinator runtime unavailable`, xử lý dependency/policy trước khi nghiệm thu. Chỉ khi muốn thực hiện phiên thật, bỏ `--check` và nhập token ở prompt ẩn. Lượt thật sẽ gọi DeepSeek và gửi HTTP đến target; không được hiểu lệnh check là bằng chứng đã quét.
 
 Runner chọn tối đa 6 đường dẫn từ wordlist merge, nhưng Recon/Parameter/Soft404 cũng tiêu ngân sách 200. Tốc độ tối đa 0,5 request/giây; deadline 1.200 giây; HTTP timeout8 giây; LLM timeout120 giây, quota60 calls, output tối đa8.192 tokens/call. Không retry module với `--max-retries 0`. Giới hạn phase vẫn giữ; không đảm bảo 200 dispatch đủ để hoàn thành năm Agent.
 

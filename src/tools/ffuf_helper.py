@@ -49,11 +49,11 @@ class FfufToolHelper(BaseToolHelper):
                 "ffuf_binary": "str: executable, otherwise FFUF_PATH/PATH/project tools",
                 "extensions": "list/str: ffuf -e extensions",
                 "auto_calibrate": "bool: ffuf -ac, adds requests and filters responses",
-                "match_codes": "str/list: codes/ranges or all (default)",
-                "filter_codes": "str/list: excluded status codes/ranges",
-                "filter_size": "str/int: excluded sizes/ranges",
-                "filter_words": "str/int: excluded word counts/ranges",
-                "filter_lines": "str/int: excluded line counts/ranges",
+                "match_codes": "str/list: ffuf CLI codes/ranges or all; native engines preserve all measured attempts",
+                "filter_codes": "str/list: ffuf CLI excluded status codes/ranges; ignored by native engines",
+                "filter_size": "str/int: ffuf CLI excluded sizes/ranges; ignored by native engines",
+                "filter_words": "str/int: ffuf CLI excluded word counts/ranges; ignored by native engines",
+                "filter_lines": "str/int: ffuf CLI excluded line counts/ranges; ignored by native engines",
                 "recursion": "bool: ffuf recursive discovery, default false",
                 "recursion_depth": "int: maximum depth, default 1",
                 "threads": "int: concurrency, default 1",
@@ -304,7 +304,11 @@ class FfufToolHelper(BaseToolHelper):
                     if engine == "proxy_http":
                         native_options["engine"] = "proxy_http"
                     data = run_http_fuzzing(target, wordlist, **native_options)
-                data["results"] = [row for row in data.get("results", []) if self._keep_result(row, kwargs)]
+                # Native engines expose their complete measured work, including
+                # timeout records with status=None. Applying a CLI matcher here
+                # hid those attempts (and valid 404 responses) after dispatch,
+                # even though the engine reports these filters as ignored.
+                data.setdefault("results", [])
                 for row in data["results"]:
                     row.setdefault("input_value", row.get("input"))
                 data.setdefault("stats", {})["matched_responses"] = sum(row.get("status_code") is not None for row in data["results"])

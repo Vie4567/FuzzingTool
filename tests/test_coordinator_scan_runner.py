@@ -127,6 +127,23 @@ class CoordinatorScanRunnerTests(unittest.TestCase):
         self.assertNotIn("test-bearer-secret", stdout.getvalue())
         self.assertNotIn(self.settings["DEEPSEEK_API_KEY"], stdout.getvalue())
 
+    def test_blocked_runtime_fails_before_token_prompt_or_pipeline(self):
+        for extra in ([], ["--check"]):
+            stdout = io.StringIO()
+            with self.subTest(extra=extra), patch.dict(os.environ), \
+                 patch.object(runner, "read_settings", return_value=self.settings), \
+                 patch("src.coordinator.build_coordinator_graph", side_effect=ImportError("private-import-fixture")), \
+                 patch.object(runner, "getpass") as prompt, \
+                 patch("src.coordinator.run_pipeline_supervised") as pipeline, \
+                 patch.object(Path, "mkdir") as mkdir, redirect_stdout(stdout):
+                code = runner.main(["--target", "https://authorized.example", *extra])
+            self.assertEqual(code, 2)
+            prompt.assert_not_called()
+            pipeline.assert_not_called()
+            mkdir.assert_not_called()
+            self.assertIn("Coordinator runtime unavailable", stdout.getvalue())
+            self.assertNotIn("private-import-fixture", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

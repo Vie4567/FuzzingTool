@@ -61,6 +61,14 @@ class SharedState(TypedDict, total=False):
     # ── META ─────────────────────────────────────────────────
     session_id: str                     # UUID phiên chạy
     target_url: str                     # URL mục tiêu
+    # B1 additive public contract. No secrets; null statuses mean unmeasured.
+    origin_contract_version: int
+    approved_origins: list              # Operator approval only, never discovery
+    discovered_origins: list            # Origin + source references; not permission
+    origin_policies: dict               # Public exact path/method/read-only rules
+    origin_contexts: dict               # Per-origin profile/context/status/endpoints
+    origin_execution_mode: str          # legacy_untracked | not_enabled_b1
+    discovery_summary: dict            # Passive resource kinds/unresolved counts; not HTTP verification
     started_at: str                     # ISO datetime bắt đầu
     finished_at: Optional[str]          # ISO datetime kết thúc
     config: dict                        # User config (custom options)

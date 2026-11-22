@@ -70,7 +70,7 @@ class DeadlineChatOpenAI(ChatOpenAI):
             # Copying the SDK settings preserves credentials/base URL/default
             # headers while giving this call its own cancellable connection.
             async with httpx.AsyncClient(proxy=self.openai_proxy or None,
-                                         timeout=seconds, follow_redirects=True) as transport:
+                                         timeout=seconds, follow_redirects=False) as transport:
                 client = self.root_async_client.with_options(
                     http_client=transport, timeout=seconds, max_retries=0,
                 )

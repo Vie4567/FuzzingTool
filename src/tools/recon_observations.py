@@ -4,6 +4,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, urldefrag, parse_qs
 
 from .recon_http import _origin
+from .recon_discovery import annotate, content_id
 
 
 def absolute_url(value, base_url):
@@ -67,7 +68,7 @@ def query_parameters(url, source, source_url, method="GET"):
 
 
 class _DOMParser(HTMLParser):
-    def __init__(self, base_url):
+    def __init__(self, base_url, body=""):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
         self.resolution_base = base_url
@@ -75,16 +76,23 @@ class _DOMParser(HTMLParser):
         self.observations, self.parameters, self.forms, self.scripts = [], [], [], []
         self.form = None
         self.meta_generator = None
+        self.digest = content_id(body)
+        self.tag = None
 
-    def _path(self, value, method=None):
+    def _path(self, value, method=None, *, hint=None, attribute=None, source_type="html"):
         row = path_observation(value, self.resolution_base, "dom", method=method)
         if row:
-            row["source_url"] = self.base_url
+            line, column = self.getpos()
+            annotate(row, source_type=source_type, source_url=self.base_url, digest=self.digest,
+                     location={"line": line, "column": column + 1, "tag": self.tag, "attribute": attribute}, hint=hint)
             self.observations.append(row)
-            self.parameters.extend(query_parameters(row["url"], "dom", self.base_url, method=method or "GET"))
+            for param in query_parameters(row["url"], "dom", self.base_url, method=method):
+                param.update(evidence_refs=row["evidence_refs"], evidence_location=row["evidence_location"])
+                self.parameters.append(param)
         return row
 
     def handle_starttag(self, tag, attrs):
+        self.tag = tag
         attrs = dict(attrs)
         if tag == "base" and not self.base_seen:
             base = absolute_url(attrs.get("href"), self.base_url)
@@ -93,19 +101,23 @@ class _DOMParser(HTMLParser):
         if tag == "meta" and (attrs.get("name") or "").lower() == "generator":
             self.meta_generator = attrs.get("content")
         if tag in {"a", "link"}:
-            self._path(attrs.get("href"))
+            self._path(attrs.get("href"), hint="navigation" if tag == "a" else None, attribute="href")
         if tag == "script":
-            row = self._path(attrs.get("src"))
+            row = self._path(attrs.get("src"), attribute="src")
             if row:
                 self.scripts.append(row["url"])
+        if tag in {"img", "source", "video", "audio"}:
+            self._path(attrs.get("src"), attribute="src")
         for attr in ("data-url", "data-api", "data-href", "data-action", "formaction"):
-            self._path(attrs.get(attr))
+            self._path(attrs.get(attr), hint="api_attribute" if attr == "data-api" else None, attribute=attr)
         if tag == "form":
             method = (attrs.get("method") or "GET").upper()
-            row = self._path(attrs.get("action") or self.base_url, method)
+            row = self._path(attrs.get("action") or self.base_url, method, attribute="action", source_type="form")
             self.form = {"action": row["url"] if row else "", "method": method, "params": [],
                          "source": "dom", "source_url": self.base_url,
                          "classification": "observed" if row else "candidate"}
+            if row:
+                self.form.update(evidence_refs=row["evidence_refs"], evidence_location=row["evidence_location"])
             self.forms.append(self.form)
         if tag in {"input", "select", "textarea", "button"} and attrs.get("name"):
             name = attrs["name"]
@@ -113,9 +125,14 @@ class _DOMParser(HTMLParser):
                 if name not in self.form["params"]:
                     self.form["params"].append(name)
                 method = self.form["method"]
-                self.parameters.append({"name": name, "location": "query" if method == "GET" else "body",
+                parameter = {"name": name, "location": "query" if method == "GET" else "body",
                                         "url": self.form["action"], "method": method, "source": "html_form",
-                                        "source_url": self.base_url, "classification": self.form["classification"]})
+                                        "source_url": self.base_url, "classification": self.form["classification"]}
+                if self.form["action"]:
+                    line, column = self.getpos()
+                    annotate(parameter, source_type="form", source_url=self.base_url, digest=self.digest,
+                             location={"line": line, "column": column + 1, "tag": tag, "attribute": "name"})
+                self.parameters.append(parameter)
             else:
                 self.parameters.append({"name": name, "location": "unknown", "url": self.base_url,
                                         "source": "html_input", "classification": "candidate"})
@@ -126,7 +143,7 @@ class _DOMParser(HTMLParser):
 
 
 def parse_dom(body, base_url, fp_data):
-    parser = _DOMParser(base_url)
+    parser = _DOMParser(base_url, body)
     errors = []
     try:
         parser.feed(body)

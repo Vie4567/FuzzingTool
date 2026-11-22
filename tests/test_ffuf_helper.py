@@ -28,7 +28,7 @@ class Fixture(BaseHTTPRequestHandler):
             status, body = 302, b"moved"
         elif self.path == "/rate":
             status, body = 429, b"slow-down"
-        elif self.path == "/slow":
+        elif self.path.split("?", 1)[0] == "/slow":
             time.sleep(0.5)
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
@@ -210,6 +210,45 @@ class FfufHelperTests(unittest.TestCase):
         self.assertEqual(result.error_message, "transport_error")
         self.assertEqual(result.result_data["stats"]["attempted_requests"], 1)
         self.assertEqual(result.result_data["stats"]["responses_received"], 0)
+
+    def test_native_matcher_cannot_erase_six_timeout_measurements(self):
+        words = [f"slow?i={index}" for index in range(6)]
+        result = self.helper.run(target_url=self.url, wordlist=words, engine="python_http",
+                                 match_codes="200,204,301,302,307,401,403",
+                                 rate_limit=100, timeout_seconds=0.1)
+        data = result.result_data
+        self.assertFalse(result.success)
+        self.assertEqual(data["stop_reason"], "transport_error")
+        self.assertEqual(data["stats"]["attempted_requests"], 6)
+        self.assertEqual(data["stats"]["responses_received"], 0)
+        self.assertEqual(data["stats"]["network_errors"], 6)
+        self.assertEqual(data["stats"]["returned_results"], 6)
+        self.assertEqual(len(data["results"]), 6)
+        self.assertEqual(len(data["errors"]), 6)
+        self.assertEqual(Fixture.calls, ["/" + word for word in words])
+        for row in data["results"]:
+            self.assertIsNone(row["status_code"])
+            self.assertGreater(row["response_time"], 0)
+            self.assertIn("timed out", row["error"])
+
+    def test_native_filters_preserve_200_404_and_transport_error(self):
+        result = self.helper.run(target_url=self.url, wordlist=["ok", "missing", "slow"],
+                                 engine="python_http", match_codes="200", filter_codes="404",
+                                 filter_size="15", rate_limit=100, timeout_seconds=0.1)
+        data = result.result_data
+        self.assertFalse(result.success)
+        self.assertTrue(data["partial"])
+        self.assertEqual(data["stop_reason"], "partial_transport_error")
+        self.assertEqual([row["status_code"] for row in data["results"]], [200, 404, None])
+        self.assertEqual([row["content_length"] for row in data["results"][:2]], [15, 9])
+        self.assertEqual(data["stats"]["attempted_requests"], 3)
+        self.assertEqual(data["stats"]["responses_received"], 2)
+        self.assertEqual(data["stats"]["network_errors"], 1)
+        self.assertEqual(data["stats"]["matched_responses"], 2)
+        self.assertEqual(data["stats"]["returned_results"], 3)
+        self.assertTrue(any("match_codes is not applied" in warning for warning in data["warnings"]))
+        self.assertTrue(any("filter_codes is not applied" in warning for warning in data["warnings"]))
+        self.assertEqual(Fixture.calls, ["/ok", "/missing", "/slow"])
 
     def test_cli_remaining_attempts_stay_unknown_even_after_success(self):
         result = self.run_ffuf(["ok", "missing"])
