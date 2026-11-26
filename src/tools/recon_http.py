@@ -134,10 +134,25 @@ class ScopedReconTransport:
         # shared between concurrent crawl workers. Redirects never carry auth.
         opener = build_opener(*handlers)
         timeout = cap_http_timeout(timeout)
-        record_http_attempt(kind="target")
+        budget = current_runtime()
+        identity = None
+        if budget and budget.recovery:
+            candidate = budget.recovery_candidate or {}
+            identity = {"url": outgoing.full_url, "method": method,
+                        "candidate_id": candidate.get("candidate_id"),
+                        "evidence_refs": candidate.get("evidence_refs", [])}
+            for stage_key in ("probe", "soft404"):
+                if candidate.get(stage_key) is not None:
+                    # B4.2A/B4.2B: public probe identity; never headers or bodies.
+                    identity[stage_key] = dict(candidate[stage_key])
+            if self.redact(identity) != identity:
+                raise ValueError("Sensitive recovery request identity denied")
+        record_http_attempt(kind="target", request=identity)
         if _measurement is not None:
             _measurement["attempted"] = True
         try:
+            if budget and budget.recovery:
+                budget.recovery.request_event("dispatch_started")
             # Waiting for the shared rate slot may consume the deadline.
             response = opener.open(outgoing, timeout=cap_http_timeout(timeout))
         except HTTPError as exc:
@@ -217,6 +232,13 @@ class ScopedReconTransport:
             result["response_time"] = time.monotonic() - started
             if response is not None:
                 response.close()
+            budget = current_runtime()
+            if budget and budget.recovery and result["attempted"]:
+                measured = {key: result[key] for key in ("status_code", "content_length", "bytes_received",
+                             "body_complete", "response_time", "stop_reason")}
+                error = result.get("error")
+                measured["error"] = {key: error[key] for key in ("error_type", "exception_type", "count")} if error else None
+                budget.recovery.request_event("measurement", measured)
         if response is not None:
             charset = response.headers.get_content_charset() or "utf-8"
             try:

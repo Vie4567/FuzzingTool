@@ -40,6 +40,12 @@ class FuzzingAgent(BaseAutonomousAgent):
         self.principles = self._load_knowledge("agent_operating_principles.json")
         self.assembler = EndpointAssembler()
 
+    def dispatch_selected(self, shared_state, *, transport, artifact_root=None, engine="python_http"):
+        """B3.1 harness: dispatch B2.2 selections; never enable the full graph."""
+        from src.tools.origin_dispatch import dispatch_selected
+        return dispatch_selected(shared_state, transport=transport,
+                                 artifact_root=artifact_root, engine=engine)
+
     def _load_knowledge(self, fname: str) -> dict:
         p = Path(__file__).resolve().parents[2] / "knowledge" / fname
         if p.exists():

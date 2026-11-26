@@ -49,6 +49,11 @@ _EXECUTION_NODES = {"run_tech_recon": "tech_recon", "run_wordlist_gen": "wordlis
                     "run_fuzzing": "fuzzing", "run_param_discovery": "param_disc", "run_soft404_filter": "soft404_filter"}
 
 
+def _local_origin_test():
+    run = _active_run.get()
+    return run.get("local_origin_test") if run else None
+
+
 def _output(result, fields, agent):
     if not isinstance(result, dict) or not result:
         raise ValueError(f"{agent} returned an empty or non-object result")
@@ -211,14 +216,24 @@ def _checkpointed(node):
         if run is None:
             return node(state)
         run["state"], run["node"] = state, node.__name__
+        local = _local_origin_test()
+        if local:
+            local.enter_node(state, node.__name__)
         sync_state(state)
         run["artifacts"].save(state, node=node.__name__, event="started")
         completed = False
         with telemetry_phase(node.__name__):
             try:
-                if node.__name__ not in {"validate_input", "init_state", "generate_report"}:
+                if local and local.reuse_node(state, node.__name__):
+                    # Compiled graph still traverses the same nodes. Their
+                    # completed Agent bodies are not invoked or counted again.
+                    completed = True
+                    return state
+                if node.__name__ not in {"validate_input", "init_state", "generate_report"} and (
+                        not local or node.__name__ in _EXECUTION_NODES):
                     check_deadline()
-                if node.__name__ in _EXECUTION_NODES:
+                if node.__name__ in _EXECUTION_NODES and not (local and local.continuing_node(node.__name__)
+                        and state.get("agent_attempts", {}).get(_EXECUTION_NODES[node.__name__], 0)):
                     agent = _EXECUTION_NODES[node.__name__]
                     attempts = state.setdefault("agent_attempts", {})
                     count = attempts.get(agent, 0)
@@ -236,10 +251,16 @@ def _checkpointed(node):
                 completed = True
                 return result
             finally:
+                if local:
+                    local.leave_node(run["state"], node.__name__, completed)
                 sync_state(run["state"])
                 run["state"]["runtime"] = runtime_snapshot()
-                run["artifacts"].save(run["state"], node=node.__name__,
-                                      event="checkpoint" if completed else "interrupted")
+                event = "checkpoint" if completed else "interrupted"
+                if local and completed:
+                    event = local.completion_event(node.__name__)  # B4.2C: finalize skips are not completions
+                public = run["artifacts"].save(run["state"], node=node.__name__, event=event)
+                if local:
+                    local.saved_checkpoint(public, node.__name__, event)
     return execute
 
 
@@ -327,10 +348,14 @@ def validate_input(state: dict) -> dict:
         # B1 adds a public contract without enabling unguarded Agent dispatch.
         # Exact multi-origin policy is not wired through every engine until B3.
         if "multi_origin" in config:
-            from .origins import origin_state
-            state.update(origin_state(url, config["multi_origin"]))
-            state["stop_reason"] = "multi_origin_execution_not_enabled_b1"
-            raise InputValidationError("multi_origin execution is unavailable until all dispatch guards are integrated (B3)")
+            local = _local_origin_test()
+            if local:
+                local.validate(state)
+            else:
+                from .origins import origin_state
+                state.update(origin_state(url, config["multi_origin"]))
+                state["stop_reason"] = "multi_origin_execution_not_enabled_b1"
+                raise InputValidationError("multi_origin execution is unavailable until all dispatch guards are integrated (B3)")
     except (InputValidationError, TypeError, ValueError) as exc:
         state["agent_statuses"]["validate"] = "failed"
         state["audit_log"].append({
@@ -421,12 +446,18 @@ def init_state(state: dict) -> dict:
         f"[Coordinator] Session {state['session_id'][:8]}... initialized "
         f"for {state['target_url']}"
     )
+    if _local_origin_test():
+        _local_origin_test().initialize(state)
     return state
 
 
 @_checkpointed
 def run_tech_recon(state: dict) -> dict:
     """Node: Agent 1 — Tech Recon."""
+    if _local_origin_test():
+        state = _local_origin_test().recon(state, TechReconAgent)
+        _sync_recon_errors(state, state["recon_execution"].get("errors", []))
+        return state
     state["agent_statuses"]["tech_recon"] = "running"
     state["audit_log"].append({
         "type": "agent_started",
@@ -529,6 +560,8 @@ def run_tech_recon(state: dict) -> dict:
 @_checkpointed
 def llm_decide_after_recon(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Tech Recon (Decision Point D2)."""
+    if _local_origin_test():
+        return _local_origin_test().decide(state, "after_recon")
     engine = _get_decision_engine(state.get("config"))
 
     subagent_just = state.get("subagent_justifications", {}).get("tech_recon", "")
@@ -563,6 +596,8 @@ def llm_decide_after_recon(state: dict) -> dict:
 @_checkpointed
 def run_wordlist_gen(state: dict) -> dict:
     """Node: Agent 2 — Wordlist Generator."""
+    if _local_origin_test():
+        return _local_origin_test().wordlist(state, WordlistGenAgent)
     state["agent_statuses"]["wordlist_gen"] = "running"
     state["audit_log"].append({
         "type": "agent_started",
@@ -634,6 +669,8 @@ def run_wordlist_gen(state: dict) -> dict:
 @_checkpointed
 def llm_decide_after_wordlist(state: dict) -> dict:
     """Node: 🧠 LLM quyết định sau Wordlist Generation (Decision Point D3)."""
+    if _local_origin_test():
+        return _local_origin_test().decide(state, "after_wordlist")
     engine = _get_decision_engine(state.get("config"))
 
     subagent_just = state.get("subagent_justifications", {}).get("wordlist_gen", "")
@@ -664,6 +701,13 @@ def llm_decide_after_wordlist(state: dict) -> dict:
 @_checkpointed
 def run_fuzzing(state: dict) -> dict:
     """Node: Agent 3 — Real HTTP fuzzing, preserving partial measurements."""
+    if _local_origin_test():
+        state = _local_origin_test().fuzzing(state, FuzzingAgent)
+        errors = [{**r["error"], "error": r["error"]["exception_type"], "status_code": r["status_code"]}
+                  for e in state["origin_contexts"].values()
+                  for r in e["context"]["http_dispatch"]["records"] if r["attempted"] and r["error"]]
+        _sync_fuzzing_errors(state, errors)
+        return state
     state["agent_statuses"]["fuzzing"] = "running"
     config_adj = dict(state.get("_config_adjustments") or {})
     # Manager plans may tune measurement settings, but only operator config can
@@ -794,6 +838,8 @@ def llm_decide_after_fuzzing(state: dict) -> dict:
     Bao gồm Agent Skip logic — LLM quyết định có nên chạy
     param_disc hay skip trực tiếp sang filter_404.
     """
+    if _local_origin_test():
+        return _local_origin_test().decide(state, "after_fuzzing")
     execution = state.get("fuzzing_execution", {})
     if execution.get("partial") or execution.get("stop_reason") not in (None, "", "completed"):
         # Preserve measured responses without repeating a blocked/limited scan.
@@ -871,6 +917,8 @@ def _verification_execution_status(result):
 @_checkpointed
 def run_param_discovery(state: dict) -> dict:
     """Node: Agent 4 — Parameter Discovery."""
+    if _local_origin_test():
+        return _local_origin_test().parameters(state, ParamDiscoveryAgent)
     state["agent_statuses"]["param_disc"] = "running"
     state["audit_log"].append({
         "type": "agent_started",
@@ -955,6 +1003,8 @@ def run_param_discovery(state: dict) -> dict:
 @_checkpointed
 def run_soft404_filter(state: dict) -> dict:
     """Node: Agent 5 — Soft 404 Filter."""
+    if _local_origin_test() and _local_origin_test().soft404_verification:
+        return _local_origin_test().soft404(state, Soft404FilterAgent)
     state["agent_statuses"]["soft404_filter"] = "running"
     state["audit_log"].append({
         "type": "agent_started",
@@ -1056,6 +1106,9 @@ def run_soft404_filter(state: dict) -> dict:
 @_checkpointed
 def generate_report(state: dict) -> dict:
     """Node: Tổng hợp báo cáo cuối cùng."""
+    if _local_origin_test():
+        # B4.2C: per-origin Report; the final pipeline status is set after Reflection.
+        _local_origin_test().report(state)
     state["finished_at"] = datetime.now(timezone.utc).isoformat()
     state["audit_log"].append({
         "type": "report_generated",
@@ -1082,6 +1135,9 @@ def generate_report(state: dict) -> dict:
 @_checkpointed
 def post_session_reflection(state: dict) -> dict:
     """Node: 🧠 LLM rút bài học → lưu Knowledge Store."""
+    if _local_origin_test():
+        # B4.2C: deterministic, report-backed; no LLM provider and no KnowledgeStore write.
+        return _local_origin_test().reflect(state)
     if state.get("agent_statuses", {}).get("validate") == "failed":
         return state
     try:
@@ -1243,7 +1299,7 @@ def build_coordinator_graph() -> StateGraph:
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
-def run_pipeline(target_url: str, config: dict = None) -> dict:
+def run_pipeline(target_url: str, config: dict = None, *, local_origin_test=None) -> dict:
     """
     Entry point v2.0 — LLM-Driven Pipeline.
 
@@ -1317,8 +1373,16 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
 
     # Create a durable destination before any HTTP/LLM activity. Write failures
     # are explicit errors: a scan must not continue without its checkpoints.
-    artifacts = RunArtifacts(config if isinstance(config, dict) else {})
-    run = {"state": initial_state, "node": "pipeline", "artifacts": artifacts}
+    if local_origin_test is not None:
+        from .origin_local import LocalOriginTest
+        if type(local_origin_test) is not LocalOriginTest:
+            raise ValueError("An explicit localhost-only execution context is required")
+    artifact_config = config if isinstance(config, dict) else {}
+    if local_origin_test:
+        artifact_config = local_origin_test.artifact_config(artifact_config)
+    artifacts = RunArtifacts(artifact_config)
+    run = {"state": initial_state, "node": "pipeline", "artifacts": artifacts,
+           "local_origin_test": local_origin_test}
     token = _active_run.set(run)
     try:
         with telemetry_session(max_llm_calls=50), ExitStack() as contexts:
@@ -1334,15 +1398,29 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
                 except InputValidationError:
                     normalized_config = None
                 if normalized_config is not None:
+                    if local_origin_test:
+                        normalized_config = local_origin_test.configure(normalized_target, normalized_config)
                     initial_state.update(target_url=normalized_target, config=normalized_config, _input_validated=True)
-                    current_telemetry().max_llm_calls = normalized_config["max_llm_calls"]
-                    contexts.enter_context(runtime_session(normalized_config))
+                    current_telemetry().max_llm_calls = 0 if local_origin_test else normalized_config["max_llm_calls"]
+                    budget = contexts.enter_context(runtime_session(normalized_config))
+                    if local_origin_test and local_origin_test.recovery:
+                        recovery = contexts.enter_context(local_origin_test.recovery)
+                        finished = recovery.bind(local_origin_test, budget, initial_state, normalized_config)
+                        if finished is not None:
+                            # B4.2C already_finished: verified result only; no graph, Agent or journal write.
+                            return artifacts.save(local_origin_test.finished_result(finished),
+                                                  node="pipeline", event="already_finished")
+                elif local_origin_test:
+                    raise InputValidationError("Invalid localhost graph configuration")
                 app = build_coordinator_graph()
                 # Each agent execution can be followed by a decision node.
                 # Leave room for validate/init/report/reflection so LangGraph's
                 # default 25 steps cannot pre-empt our explicit execution limit.
                 max_iterations = (normalized_config or {}).get("max_iterations", 20)
-                final_state = app.invoke(initial_state, config={"recursion_limit": 2 * max_iterations + 10})
+                graph_config = {"recursion_limit": 2 * max_iterations + 10}
+                if local_origin_test:
+                    graph_config["callbacks"] = [local_origin_test.callback]
+                final_state = app.invoke(initial_state, config=graph_config)
                 run["state"] = final_state
                 sync_state(final_state)
                 final_state["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -1355,7 +1433,12 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
                     else "partial" if final_state.get("error_log") or final_state.get("stop_reason") or statuses & {"failed", "partial", "pending", "running"}
                     else "completed"
                 )
+                if local_origin_test:
+                    local_origin_test.finish(final_state)
                 public = artifacts.save(final_state, node="pipeline", event=final_state["pipeline_status"])
+                if local_origin_test and local_origin_test.recovery:
+                    local_origin_test.saved_checkpoint(public, "pipeline", final_state["pipeline_status"])
+                    local_origin_test.recovery.append("session_finished", {"pipeline_status": final_state["pipeline_status"]})
                 start_dt = datetime.fromisoformat(final_state["started_at"])
                 finish_dt = datetime.fromisoformat(final_state["finished_at"])
                 log_pipeline_summary(
@@ -1378,8 +1461,20 @@ def run_pipeline(target_url: str, config: dict = None) -> dict:
                 raise
             except BaseException as exc:
                 state = run["state"]
+                from .origin_recovery import RecoveryDenied
+                if local_origin_test and local_origin_test.recovery and isinstance(exc, RecoveryDenied):
+                    # A denied load is not a new empty session. Keep old files
+                    # intact and report accounting as unknown, never reset to 0.
+                    state["recovery"] = {"status": "blocked", "reason": str(exc),
+                        "journal": str(local_origin_test.recovery.directory / "journal.jsonl"),
+                        "safe_resume": "not_verified", "exactly_once_delivery": False}
+                    state["runtime"] = {"http_dispatches": None, "stop_reason": str(exc)}
+                    state["stop_reason"] = str(exc)
+                    current_telemetry().http_unknown(phase="recovery", source="reconciliation_denied")
                 sync_state(state)
                 state["finished_at"] = datetime.now(timezone.utc).isoformat()
+                if local_origin_test:
+                    local_origin_test.finish(state)
                 public = artifacts.record_failure(state, exc, node=run["node"])
                 if not isinstance(exc, Exception):
                     raise

@@ -122,10 +122,10 @@ def telemetry_phase(name):
         _PHASE.reset(token)
 
 
-def record_http_attempt(*, kind="target", count=1, deadline=None):
+def record_http_attempt(*, kind="target", count=1, deadline=None, request=None):
     from .runtime import before_http
     if kind != "ffuf_returned_response_lower_bound":
-        before_http(kind, deadline=deadline)
+        before_http(kind, deadline=deadline, request=request, phase=_PHASE.get())
     telemetry = _CURRENT.get()
     if telemetry is not None:
         telemetry.http_attempt(phase=_PHASE.get(), kind=kind, count=count)

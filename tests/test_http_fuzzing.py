@@ -1,10 +1,12 @@
 """Local HTTP contract tests: no external targets or LLM calls."""
 
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from src.tools.http_fuzzing import run_http_fuzzing
 from src.coordinator.runtime import runtime_session
@@ -233,8 +235,20 @@ class RealHttpTests(unittest.TestCase):
         self.assertEqual(data['results'][0]['path'], '/api/search')
 
     def test_rate_limit_applies_to_request_starts(self):
-        run_http_fuzzing(self.base, ["one", "two"], rate_limit=5)
-        self.assertGreaterEqual(_Fixture.calls[1][3] - _Fixture.calls[0][3], 0.18)
+        # Measure where the client actually starts each HTTP request: the socket
+        # connect after the rate-limit wait. Server handler arrival adds an
+        # asymmetric first-request latency that is not part of the limiter.
+        starts, connect = [], http.client.HTTPConnection.connect
+
+        def timed_connect(conn):
+            starts.append(time.perf_counter())
+            return connect(conn)
+
+        with patch.object(http.client.HTTPConnection, "connect", timed_connect):
+            run_http_fuzzing(self.base, ["one", "two"], rate_limit=5)
+        self.assertEqual([call[1] for call in _Fixture.calls], ["/one", "/two"])
+        self.assertEqual(len(starts), 2)
+        self.assertGreaterEqual(starts[1] - starts[0], 0.18)
 
     def test_body_cap_counts_only_observed_bytes(self):
         data = self.run_engine(["ok"], max_response_bytes=2)

@@ -104,6 +104,12 @@ class Soft404FilterAgent(BaseAutonomousAgent):
     def __init__(self, llm=None):
         super().__init__(agent_name="Soft404FilterAgent", llm=llm, tool_registry=default_registry)
 
+    def verify_origin_soft404(self, shared_state, *, transport, artifact_root=None, max_requests=None):
+        """B4.2B harness: classify Agent 3 observations per origin; no LLM, gate stays closed."""
+        from src.tools.origin_soft404 import verify_origin_soft404
+        return verify_origin_soft404(shared_state, transport=transport, artifact_root=artifact_root,
+                                     max_requests=max_requests)
+
     def _run_soft404_filter_internal(self, results_to_verify: list, target_url: str, **options) -> dict:
         return verify_soft404(target_url, results_to_verify, **options)
 

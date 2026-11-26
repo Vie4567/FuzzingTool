@@ -209,11 +209,13 @@ def verify_soft404(target_url, records, *, headers=None, allowed_origins=None,
                    rate_limit=1, timeout_seconds=5, max_requests=60,
                    max_duration_seconds=120, max_response_bytes=262144,
                    baseline_samples=3, similarity_threshold=0.97,
-                   distinct_threshold=0.80, enabled=True, stop_reason=None, proxy_options=None):
+                   distinct_threshold=0.80, enabled=True, stop_reason=None, proxy_options=None, transport=None):
     """Re-measure GET candidates and compare with scoped sibling controls.
 
     ``genuine`` means a distinct successful HTTP representation, not proof of a
     valid SPA route. Equal byte lengths alone never establish a classification.
+    A supplied `transport` (B4.2B origin probe transport) replaces the single-
+    target scoped transport; network policy keywords must then stay unset.
     """
     if not isinstance(records, list) or not all(isinstance(row, dict) for row in records):
         raise ValueError("records must be a list of mappings")
@@ -234,9 +236,14 @@ def verify_soft404(target_url, records, *, headers=None, allowed_origins=None,
     runtime = current_runtime()
     if runtime:
         cap = min(cap, runtime.body_cap)
-    transport = ScopedVerificationTransport(target_url, headers=headers, allowed_origins=allowed_origins,
-                                     auth_origins=auth_origins, verify_ssl=verify_ssl, tls_ca_file=tls_ca_file,
-                                     proxy_options=proxy_options)
+    if transport is not None:
+        if (headers is not None or allowed_origins is not None or auth_origins is not None
+                or verify_ssl is not True or tls_ca_file is not None or proxy_options is not None):
+            raise ValueError("A supplied transport owns network policy")
+    else:
+        transport = ScopedVerificationTransport(target_url, headers=headers, allowed_origins=allowed_origins,
+                                         auth_origins=auth_origins, verify_ssl=verify_ssl, tls_ca_file=tls_ca_file,
+                                         proxy_options=proxy_options)
     copied = deepcopy(records)
     for row in copied:
         for field in _STALE:

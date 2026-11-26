@@ -74,7 +74,8 @@ def normalize_origin_config(config):
             raise ValueError("rules must contain at most 256 exact path rules")
         cleaned = []
         for rule in rules:
-            if not isinstance(rule, dict) or set(rule) - {"path", "query", "methods", "operation"}:
+            if not isinstance(rule, dict) or set(rule) - {"path", "query", "methods", "operation", "parameters",
+                                                          "soft404_controls"}:
                 raise ValueError("Unsupported scope rule")
             methods = rule.get("methods")
             if (not isinstance(methods, list) or not methods
@@ -88,8 +89,27 @@ def normalize_origin_config(config):
             full = origin + path + ("?" + query if query else "")
             if public_url(full) != full:
                 raise ValueError("Scope URLs must already be canonical")
-            cleaned.append({"path": path, "query": query, "methods": sorted(set(methods)),
-                            "operation": "read_only"})
+            entry = {"path": path, "query": query, "methods": sorted(set(methods)), "operation": "read_only"}
+            if "parameters" in rule:
+                # B4.1: operator-named query parameters that may be probed on
+                # this exact GET rule. Absent means no parameter probing.
+                names = rule["parameters"]
+                if (not isinstance(names, list) or not 1 <= len(names) <= 32 or len(set(names)) != len(names)
+                        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", name)
+                               or name.startswith("__sentinel_") or sanitize_for_log(name) != name for name in names)):
+                    raise ValueError("parameters must list 1..32 unique literal query parameter names")
+                if "GET" not in entry["methods"]:
+                    raise ValueError("Parameter probes require an explicit GET rule")
+                entry["parameters"] = sorted(names)
+            if "soft404_controls" in rule:
+                # B4.2B: explicit operator grant for sibling missing-path controls.
+                # Absent means no Soft404 controls; only literal true is accepted.
+                if rule["soft404_controls"] is not True:
+                    raise ValueError("soft404_controls must be true when present")
+                if "GET" not in entry["methods"]:
+                    raise ValueError("Soft404 controls require an explicit GET rule")
+                entry["soft404_controls"] = True
+            cleaned.append(entry)
         normalized[origin] = {"rules": cleaned, "credential_profile": profile}
     for origin in approved:
         normalized.setdefault(origin, {"rules": [], "credential_profile": None})

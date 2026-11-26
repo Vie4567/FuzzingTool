@@ -39,6 +39,27 @@ class ParamDiscoveryAgent(BaseAutonomousAgent):
         super().__init__(agent_name="ParamDiscoveryAgent", llm=llm, tool_registry=default_registry)
         self.assembler = ParameterAssembler()
 
+    def verify_origin_parameters(self, shared_state, *, transport, artifact_root=None, max_requests=None):
+        """B4.1 harness: verify operator-listed query parameters per origin.
+
+        Consumes Agent 3 observations only. The static assembler vocabulary is
+        built without an LLM; the full multi-origin graph stays disabled.
+        """
+        from src.tools.origin_parameters import verify_origin_parameters
+        observed = [r.get("url") for entry in shared_state.get("origin_contexts", {}).values()
+                    for r in ((entry or {}).get("context") or {}).get("http_dispatch", {}).get("records", [])
+                    if isinstance(r.get("url"), str)]
+        assembled = self.assembler.assemble(dev_profile=None, observed_urls=observed, tech_stack=None,
+                                            llm=None, max_params=300)
+        components = assembled.get("components", {})
+        naming = assembled.get("metadata", {}).get("naming_convention", "snake_case")
+
+        def static_names_for(path):
+            return [(row["name"], row.get("type")) for row in self._match_params_for_path(path, components, naming)]
+
+        return verify_origin_parameters(shared_state, transport=transport, static_names_for=static_names_for,
+                                        artifact_root=artifact_root, max_requests=max_requests)
+
     def _match_params_for_path(
         self,
         path: str,

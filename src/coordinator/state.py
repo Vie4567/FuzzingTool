@@ -68,6 +68,9 @@ class SharedState(TypedDict, total=False):
     origin_policies: dict               # Public exact path/method/read-only rules
     origin_contexts: dict               # Per-origin profile/context/status/endpoints
     origin_execution_mode: str          # legacy_untracked | not_enabled_b1
+    local_origin_execution: dict        # B3.2A loopback-only graph trace/status; no private context
+    multi_origin_report: dict           # B4.2C local per-origin Report {content, digest}; no verdict without evidence
+    local_reflection: dict              # B4.2C deterministic, report-backed observations; knowledge_writes = 0
     discovery_summary: dict            # Passive resource kinds/unresolved counts; not HTTP verification
     started_at: str                     # ISO datetime bắt đầu
     finished_at: Optional[str]          # ISO datetime kết thúc
@@ -131,6 +134,7 @@ class SharedState(TypedDict, total=False):
     llm_call_count: int                 # Tổng LLM calls (agents + coordinator)
     total_http_requests: Optional[int]  # None nếu chưa có telemetry đầy đủ, không đoán từ wordlist
     fuzzing_execution: dict             # engine/success/partial/stop_reason và lỗi thực thi
+    recovery: dict                      # B3.2B public journal refs/status; never credentials or authority
     error_log: list                     # Danh sách lỗi
     circuit_breaker_state: dict         # {agent_name: "closed"|"open"|"half_open"}
     iteration_count: int                # Đếm iteration (chống loop vô hạn)

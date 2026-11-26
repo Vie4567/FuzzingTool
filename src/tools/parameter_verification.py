@@ -68,7 +68,7 @@ def verify_parameters(target_url, records, *, headers=None, allowed_origins=None
                       auth_origins=None, verify_ssl=True, tls_ca_file=None,
                       rate_limit=1, timeout_seconds=5, max_requests=60,
                       max_duration_seconds=120, max_response_bytes=262144,
-                      enabled=True, stop_reason=None, proxy_options=None):
+                      enabled=True, stop_reason=None, proxy_options=None, transport=None):
     """Compare two baselines, two random-name controls and two value pairs.
 
     Two identical repeats per value must be complete 2xx responses. A fresh
@@ -79,6 +79,8 @@ def verify_parameters(target_url, records, *, headers=None, allowed_origins=None
     Every attempt, including failed opens and control requests, consumes budget.
     With a proxy pool, each endpoint's controls and candidate repeats stay on
     one profile; round-robin selection happens between endpoint checks.
+    A supplied `transport` (B4.1 origin probe transport) replaces the single-
+    target scoped transport; network policy keywords must then stay unset.
     """
     if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
         raise ValueError("records must be a list of mappings")
@@ -93,9 +95,14 @@ def verify_parameters(target_url, records, *, headers=None, allowed_origins=None
         rate, timeout = min(rate, 10), min(timeout, 30)
     if current_runtime():
         cap = min(cap, current_runtime().body_cap)
-    transport = ScopedVerificationTransport(target_url, headers=headers, allowed_origins=allowed_origins,
-                                            auth_origins=auth_origins, verify_ssl=verify_ssl,
-                                            tls_ca_file=tls_ca_file, proxy_options=proxy_options)
+    if transport is not None:
+        if (headers is not None or allowed_origins is not None or auth_origins is not None
+                or verify_ssl is not True or tls_ca_file is not None or proxy_options is not None):
+            raise ValueError("A supplied transport owns network policy")
+    else:
+        transport = ScopedVerificationTransport(target_url, headers=headers, allowed_origins=allowed_origins,
+                                                auth_origins=auth_origins, verify_ssl=verify_ssl,
+                                                tls_ca_file=tls_ca_file, proxy_options=proxy_options)
     rows = deepcopy(records)
     stats = {"total_requests": 0, "responses_received": 0, "bytes_read": 0,
              "baseline_requests": 0, "control_requests": 0, "candidate_requests": 0,
